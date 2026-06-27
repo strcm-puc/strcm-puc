@@ -1,0 +1,25 @@
+# Secrets — never commit or push
+secrets/
+
+# macOS
+.DS_Store
+
+# Environment variables
+.env
+.env.*
+
+# Node
+node_modules/
+.next/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+venv/
+.venv/

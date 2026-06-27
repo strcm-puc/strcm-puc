@@ -1,0 +1,18 @@
+{
+  "name": "st-apex-system",
+  "version": "1.0.0",
+  "description": "ST APEX System",
+  "main": "firebase-config.js",
+  "scripts": {
+    "test:firebase": "node firebase-config.js",
+    "setup:schema": "node setup-schema.js",
+    "test:vault": "node test-vault.js",
+    "run:nightly-test": "node pipeline/run-nightly.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "firebase-admin": "^13.4.0"
+  }
+}
