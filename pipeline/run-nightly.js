@@ -1,5 +1,5 @@
-const { scrapeRcmSales } = require('./scraper');
-const { ingestSalesData } = require('./data-ingestion');
+const { scrapeWithRetry } = require('./scraper');
+const { ingestTransactions } = require('./data-ingestion');
 const { calculateRewards } = require('./reward-calculator');
 const { decideMessageNeeded } = require('./message-decider');
 const { writeMessage } = require('./message-writer');
@@ -26,9 +26,9 @@ async function runNightly() {
   console.log(`Run date: ${runDate}`);
   console.log('========================================');
 
-  const scrapeResult = await runStep('scraper', () => scrapeRcmSales(runDate));
+  const scrapeResult = await runStep('scraper', () => scrapeWithRetry());
   const ingestResult = await runStep('data-ingestion', () =>
-    ingestSalesData(scrapeResult),
+    ingestTransactions(scrapeResult.transactions),
   );
 
   const dummyCustomers = [DUMMY_CUSTOMER];
