@@ -1,0 +1,274 @@
+'use strict';
+
+// ════════════════════════════════════════════════════════════════════════════════
+// ST Rupees store-code exclusion — 4-case test suite.
+//
+//  Case 1: Normal AB ID purchase → Layer 1 credit applied as usual.
+//  Case 2: ST Rupees store-code transaction → zero Layer 1, applyCredit not called.
+//  Case 3: Mixed period (normal + store-code) → only normal amount in genuineSales.
+//  Case 4: Full 17-test reward-calculator regression suite — 0 regressions.
+// ════════════════════════════════════════════════════════════════════════════════
+
+const pathMod = require('path');
+const { EventEmitter } = require('events');
+const { execSync }     = require('child_process');
+
+const ROOT       = pathMod.resolve(__dirname, '..');
+const STORE_CODE = 'STORE123';
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+function injectMock(absPath, exports) {
+  require.cache[absPath] = { id: absPath, filename: absPath, loaded: true, exports };
+}
+
+function freshBaseReward(applyCredit) {
+  injectMock(pathMod.join(ROOT, 'vault-read.js'), {
+    getCredential: async (cat) =>
+      cat === 'rcm_login' ? { store_code: STORE_CODE } : { api_key: 'test' },
+  });
+  injectMock(pathMod.join(ROOT, 'pipeline', 'ledger-writer.js'), { applyCredit });
+  delete require.cache[require.resolve('./base-reward-calculator')];
+  return require('./base-reward-calculator');
+}
+
+function makeFirestoreStore() {
+  const store = new Map();
+  function makeDocRef(docPath) {
+    return {
+      _path: docPath,
+      get: async () => {
+        const d = store.get(docPath);
+        return { exists: d !== undefined, data: () => d ?? null, id: docPath.split('/').pop() };
+      },
+      set: async (data, opts) => {
+        store.set(docPath, opts?.merge ? { ...(store.get(docPath) ?? {}), ...data } : data);
+      },
+      collection: (sub) => makeCollRef(`${docPath}/${sub}`),
+    };
+  }
+  function makeCollRef(colPath) {
+    return {
+      _path: colPath,
+      doc: (id) => makeDocRef(`${colPath}/${id ?? `a_${Math.random().toString(36).slice(2)}`}`),
+      add: async (data) => { const id = `a_${Math.random().toString(36).slice(2)}`; store.set(`${colPath}/${id}`, data); return { id }; },
+      where: () => ({ limit: () => ({ get: async () => ({ empty: true, docs: [] }) }) }),
+      get: async () => {
+        const prefix = colPath + '/';
+        const docs = [];
+        for (const [k, v] of store) {
+          if (!k.startsWith(prefix) || k.slice(prefix.length).includes('/')) continue;
+          docs.push({ id: k.split('/').pop(), data: () => v });
+        }
+        return { docs };
+      },
+    };
+  }
+  const mockAdmin = { firestore: { FieldValue: { serverTimestamp: () => new Date().toISOString() } } };
+  const mockDb    = { collection: makeCollRef };
+  return { store, mockDb, mockAdmin };
+}
+
+function freshRC(mockDb, mockAdmin) {
+  injectMock(pathMod.join(ROOT, 'vault-read.js'), {
+    getCredential: async (cat) =>
+      cat === 'rcm_login' ? { store_code: STORE_CODE }
+      : cat === 'anthropic_api' ? { api_key: 'test-key' }
+      : { bot_token: 'tok', admin_chat_id: '1' },
+  });
+  injectMock(pathMod.join(ROOT, 'firebase-config.js'), { db: mockDb, admin: mockAdmin });
+  delete require.cache[require.resolve('./reward-calculator')];
+  delete require.cache[require.resolve('./ledger-writer')];
+  return require('./reward-calculator');
+}
+
+// ── Assertion helpers ──────────────────────────────────────────────────────────
+
+function check(label, actual, expected) {
+  const pass = actual === expected;
+  console.log(`  ${pass ? '✓' : '✗'}  ${label}: ${JSON.stringify(actual)}${pass ? '' : ` (expected ${JSON.stringify(expected)})`}`);
+  return pass;
+}
+function checkTruthy(label, val) {
+  const pass = !!val;
+  console.log(`  ${pass ? '✓' : '✗'}  ${label}: ${JSON.stringify(val)}`);
+  return pass;
+}
+
+// ── Case 1: Normal AB ID purchase → Layer 1 applied ───────────────────────────
+
+async function case1() {
+  console.log('\n──────────────────────────────────────────────────────────────');
+  console.log('  Case 1 — Normal AB ID purchase → Layer 1 credit');
+  console.log('──────────────────────────────────────────────────────────────\n');
+
+  let applyCallCount = 0;
+  let capturedAmount = null;
+
+  const { calculateBaseReward } = freshBaseReward(async (mobile, id, amount, reason, bill) => {
+    applyCallCount++;
+    capturedAmount = amount;
+    return { ok: true };
+  });
+
+  const result = await calculateBaseReward('9876543210', 'AB_NORMAL', 'BILL001', 5000);
+
+  let pass = true;
+  pass &= check('baseAmount = 50 (1% of 5000)', result.baseAmount, 50);
+  pass &= check('applyCredit called once', applyCallCount, 1);
+  pass &= check('applyCredit amount = 50', capturedAmount, 50);
+  pass &= checkTruthy('ledgerResult returned', result.ledgerResult);
+
+  console.log(`\n  ${pass ? 'PASS ✓' : 'FAIL ✗'}`);
+  return !!pass;
+}
+
+// ── Case 2: Store-code transaction → zero Layer 1 ─────────────────────────────
+
+async function case2() {
+  console.log('\n──────────────────────────────────────────────────────────────');
+  console.log('  Case 2 — ST Rupees store-code → zero Layer 1, no credit');
+  console.log('──────────────────────────────────────────────────────────────\n');
+
+  let applyCallCount = 0;
+
+  const { calculateBaseReward } = freshBaseReward(async () => {
+    applyCallCount++;
+    return { ok: true };
+  });
+
+  const result = await calculateBaseReward('9876543210', STORE_CODE, 'BILL002', 5000);
+
+  let pass = true;
+  pass &= check('baseAmount = 0 (excluded)', result.baseAmount, 0);
+  pass &= check('applyCredit NOT called', applyCallCount, 0);
+  pass &= check('ledgerResult = null', result.ledgerResult, null);
+
+  console.log(`\n  ${pass ? 'PASS ✓' : 'FAIL ✗'}`);
+  return !!pass;
+}
+
+// ── Case 3: Mixed period → only normal amount in genuineSales ─────────────────
+
+async function case3() {
+  console.log('\n──────────────────────────────────────────────────────────────');
+  console.log('  Case 3 — Mixed period: normal + store-code → bonus on normal only');
+  console.log('──────────────────────────────────────────────────────────────\n');
+
+  // intercept Anthropic so checkPeriodEndBonus (pure arithmetic) doesn't need it
+  const https = require('https');
+  https.request = (opts, cb) => {
+    const res = new EventEmitter(); const req = new EventEmitter();
+    req.write = () => {}; req.end = () => {
+      process.nextTick(() => { res.emit('data', JSON.stringify({ ok: true })); res.emit('end'); });
+      if (cb) cb(res);
+    };
+    return req;
+  };
+
+  const { store, mockDb, mockAdmin } = makeFirestoreStore();
+
+  // Customer with 3 months of history → rolling average
+  const MOBILE = '9876543210';
+  const AB_ID  = 'AB_NORMAL';
+  // Period under test: 2026-06
+  const TODAY  = new Date('2026-06-30');
+
+  store.set(`customers/${MOBILE}`, {
+    profile: { linked_ids: [AB_ID], name: 'Test', gender: 'M', tier: 'Saathi', consecutive_months: 2 },
+  });
+
+  // 3 months of real history (Mar, Apr, May — all 5000)
+  store.set(`customers/${MOBILE}/purchase_summary/h0`, { date: '2026-03-15', amount: '5000', id_used: AB_ID });
+  store.set(`customers/${MOBILE}/purchase_summary/h1`, { date: '2026-04-15', amount: '5000', id_used: AB_ID });
+  store.set(`customers/${MOBILE}/purchase_summary/h2`, { date: '2026-05-15', amount: '5000', id_used: AB_ID });
+
+  // June: one normal purchase (4000) + one store-code transaction (3000)
+  store.set(`customers/${MOBILE}/purchase_summary/h3`, { date: '2026-06-15', amount: '4000', id_used: AB_ID });
+  store.set(`customers/${MOBILE}/purchase_summary/h4`, { date: '2026-06-20', amount: '3000', id_used: STORE_CODE });
+
+  // Set the June period target — rolling avg 5000, growth threshold 5250 (105%)
+  store.set(`customers/${MOBILE}/period_targets/2026-06`, {
+    period_key:        '2026-06',
+    target_amount:     5250,
+    rolling_average:   5000,
+    cold_start:        false,
+    cold_start_month:  null,
+    missed_threshold:  4500,   // 90%
+    growth_threshold:  5250,   // 105%
+    period_start:      '2026-06-01',
+    period_end:        '2026-06-30',
+    reasoning:         'test',
+    set_at:            '2026-06-01T00:00:00Z',
+  });
+
+  let creditCalls = [];
+  injectMock(pathMod.join(ROOT, 'pipeline', 'ledger-writer.js'), {
+    applyCredit: async (mobile, id, amount, reason, bill) => {
+      creditCalls.push({ amount, reason });
+      return { ok: true };
+    },
+    applyDebit: async () => ({ ok: true }),
+  });
+
+  const { checkPeriodEndBonus, _setNow } = freshRC(mockDb, mockAdmin);
+  _setNow(() => TODAY);
+
+  const result = await checkPeriodEndBonus(MOBILE, TODAY);
+
+  // Normal purchase only: 4000 (store-code 3000 excluded)
+  // 4000 < 4500 (missed threshold 90%) → bracket = missed, bonusRs = 0
+  // genuineSales = 4000, not 7000
+
+  let pass = true;
+  pass &= check('result not skipped', result.skipped, false);
+  pass &= check('bracket = missed (4000 < 4500 threshold)', result.bracket, 'missed');
+  pass &= check('genuineSales = 4000 (store-code 3000 excluded)', result.genuineSales, 4000);
+  pass &= check('bonus = 0 (missed)', result.bonus?.amount, 0);
+  pass &= check('no spurious credit call (bonus=0)', creditCalls.filter(c => c.reason.includes('bonus')).length, 0);
+
+  console.log(`\n  ${pass ? 'PASS ✓' : 'FAIL ✗'}`);
+  return !!pass;
+}
+
+// ── Case 4: Full 17-test regression ───────────────────────────────────────────
+
+function case4() {
+  console.log('\n──────────────────────────────────────────────────────────────');
+  console.log('  Case 4 — Full reward-calculator 17-test regression suite');
+  console.log('──────────────────────────────────────────────────────────────\n');
+
+  try {
+    execSync('node pipeline/test-reward-calculator.js', {
+      cwd:   ROOT,
+      stdio: 'pipe',
+      encoding: 'utf8',
+    });
+    console.log('  ✓  All 17 regression tests passed');
+    return true;
+  } catch (e) {
+    console.log('  ✗  Regression tests FAILED:');
+    console.log((e.stdout || '') + (e.stderr || ''));
+    return false;
+  }
+}
+
+// ── Run all ────────────────────────────────────────────────────────────────────
+
+async function run() {
+  const r1 = await case1();
+  const r2 = await case2();
+  const r3 = await case3();
+  const r4 =        case4();
+
+  const total = 4;
+  const pass  = [r1, r2, r3, r4].filter(Boolean).length;
+
+  console.log('\n══════════════════════════════════════════════════════════════');
+  console.log(`  ST Rupees exclusion test result: ${pass}/${total} passing`);
+  console.log('══════════════════════════════════════════════════════════════\n');
+
+  if (pass < total) process.exit(1);
+}
+
+run().catch(e => { console.error('[test] FATAL:', e.message, e.stack); process.exit(1); });

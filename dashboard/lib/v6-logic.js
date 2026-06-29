@@ -397,7 +397,80 @@ function teardownV6Dashboard() {
   removeGlobals();
 }
 
+// ── Indian number format (1,48,000 style) ─────────────────────────────────────
+function _fmt(n) {
+  const s = Math.round(n).toString();
+  if (s.length <= 3) return s;
+  const last3 = s.slice(-3);
+  let rest = s.slice(0, -3);
+  const parts = [];
+  while (rest.length > 2) { parts.unshift(rest.slice(-2)); rest = rest.slice(0, -2); }
+  if (rest) parts.unshift(rest);
+  return parts.join(',') + ',' + last3;
+}
+
+function _set(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+
+function _hide(id) {
+  const el = document.getElementById(id);
+  if (el) el.style.display = 'none';
+}
+
+function _width(id, pct) {
+  const el = document.getElementById(id);
+  if (el) el.style.width = `${Math.min(Math.max(pct, 0), 100)}%`;
+}
+
+function hydrateV6Dashboard(data) {
+  if (!data) return;
+  if (progressTimer) { clearTimeout(progressTimer); progressTimer = null; }
+
+  _set('data-cust-home', data.name);
+  _set('data-cust-prof', data.name);
+
+  _set('data-life-val', _fmt(data.lifetimeEarned));
+  _set('data-avail-val', '₹' + _fmt(data.available));
+  _set('data-lse-val', '₹' + _fmt(data.lifetimeEarned));
+  _set('data-lsr-val', '₹' + _fmt(data.lifetimeRedeemed));
+  _set('data-lsa-val', '₹' + _fmt(data.available));
+
+  if (data.isAB) {
+    _set('data-month-val', '₹' + _fmt(data.abPurchases));
+    _set('data-ab-pct', data.abPct + '%');
+    _width('bf1', data.abPct);
+    _set('data-ab-id-num', 'AB #' + data.abId);
+    _set('data-ab-month-val', '₹' + _fmt(data.abPurchases));
+    _set('data-ab-coins-val', '₹' + _fmt(data.abBalance));
+  } else {
+    _hide('data-month-card');
+    _hide('data-ab-card');
+    _hide('data-ic-ab');
+  }
+
+  if (data.isDW) {
+    _set('data-dw-pct', data.dwPct + '%');
+    _width('bf2', data.dwPct);
+    _set('data-dw-id-num', 'DW #' + data.dwId);
+    _set('data-dw-month-val', '₹' + _fmt(data.dwPurchases));
+    _set('data-dw-coins-val', '₹' + _fmt(data.dwBalance));
+  } else {
+    _hide('data-dw-card');
+    _hide('data-ic-dw');
+  }
+
+  if (data.isDW && data.hasProduct) {
+    _set('data-prod-pct', data.productPct + '%');
+    _width('bf3', data.productPct);
+  } else {
+    _hide('data-prod-section');
+  }
+}
+
 module.exports = {
   initV6Dashboard,
   teardownV6Dashboard,
+  hydrateV6Dashboard,
 };

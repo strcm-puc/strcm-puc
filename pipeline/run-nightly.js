@@ -1,70 +1,68 @@
-const { scrapeWithRetry } = require('./scraper');
-const { ingestTransactions } = require('./data-ingestion');
-const { calculateRewards } = require('./reward-calculator');
-const { decideMessageNeeded } = require('./message-decider');
-const { writeMessage } = require('./message-writer');
-const { sendWhatsappMessage } = require('./sender');
+'use strict';
 
-const DUMMY_CUSTOMER = {
-  mobile: '9999999999',
-  name: 'Test Customer',
-  tier: 'Saathi',
-};
+// ── 12:05 AM IST nightly pipeline ────────────────────────────────────────────
+// Cron: 35 18 * * *  (12:05 AM IST = 6:35 PM UTC previous day)
+// VM:   cd /home/ubuntu/strcm-puc && node pipeline/run-nightly.js >> /home/ubuntu/logs/nightly.log 2>&1
+
+const { scrapeWithRetry }        = require('./scraper');
+const { ingestTransactions }     = require('./data-ingestion');
+const { runNightlyRewardChecks } = require('./reward-calculator');
+const { writeMessage }           = require('./message-writer');
 
 async function runStep(stepName, fn) {
   console.log(`\n--- START: ${stepName} ---`);
   const result = await fn();
-  console.log(`--- DONE: ${stepName} ---`, result);
+  console.log(`--- DONE: ${stepName} ---`);
   return result;
 }
 
 async function runNightly() {
-  const runDate = new Date().toISOString().slice(0, 10);
+  // salesDate = yesterday (the date whose transactions the scraper fetches)
+  const salesDate = new Date();
+  salesDate.setDate(salesDate.getDate() - 1);
+  const runDateStr = salesDate.toISOString().slice(0, 10);
 
   console.log('========================================');
-  console.log('ST-APEX Nightly Pipeline (skeleton run)');
-  console.log(`Run date: ${runDate}`);
+  console.log('ST-APEX Nightly Pipeline');
+  console.log(`Sales date: ${runDateStr}`);
   console.log('========================================');
 
+  // 1. Scrape yesterday's RCM transactions
   const scrapeResult = await runStep('scraper', () => scrapeWithRetry());
-  const ingestResult = await runStep('data-ingestion', () =>
-    ingestTransactions(scrapeResult.transactions),
+
+  // 2. Ingest — writes Layer 1 credits, returns processedMobiles Map<mobile, totalAmountToday>
+  const { processedMobiles } = await runStep('data-ingestion', () =>
+    ingestTransactions(scrapeResult.transactions)
   );
 
-  const dummyCustomers = [DUMMY_CUSTOMER];
-  const rewardResult = await runStep('reward-calculator', () =>
-    calculateRewards(dummyCustomers),
+  // 3. Reward checks:
+  //    - setPeriodTarget    → days 1-5 of new period (all customers)
+  //    - checkPeriodEndBonus → last 1-2 days of period (all customers)
+  //    - decideDailyMessage  → tonight's transaction batch only
+  //    Returns: { briefings: [{mobile, ...briefingFields}] }
+  const { briefings } = await runStep('reward-checks', () =>
+    runNightlyRewardChecks(processedMobiles, salesDate)
   );
 
-  const decideResult = await runStep('message-decider', () =>
-    decideMessageNeeded(DUMMY_CUSTOMER),
-  );
-
-  const writeResult = await runStep('message-writer', () =>
-    writeMessage(DUMMY_CUSTOMER, 'new_month_welcome', []),
-  );
-
-  const sendResult = await runStep('sender', () =>
-    sendWhatsappMessage(DUMMY_CUSTOMER, writeResult.message),
-  );
+  // 4. Write messages to send_queue for each briefing
+  //    Actual sending happens at 8 AM via run-morning.js
+  let queued = 0;
+  for (const briefing of (briefings ?? [])) {
+    const result = await writeMessage(briefing).catch(e => {
+      console.error(`[nightly] writeMessage ${briefing.mobile}: ${e.message}`);
+      return null;
+    });
+    if (result && !result.skipped) queued++;
+  }
+  console.log(`\n--- Message queue: ${queued}/${(briefings ?? []).length} briefings queued ---`);
 
   console.log('\n========================================');
-  console.log('Nightly pipeline skeleton run complete');
-  console.log(
-    'Steps executed: scraper -> data-ingestion -> reward-calculator -> message-decider -> message-writer -> sender',
-  );
+  console.log('Nightly pipeline complete');
+  console.log(`Processed: ${processedMobiles.size} customers`);
+  console.log(`Queued messages: ${queued}`);
   console.log('========================================\n');
 
-  return {
-    success: true,
-    runDate,
-    scrapeResult,
-    ingestResult,
-    rewardResult,
-    decideResult,
-    writeResult,
-    sendResult,
-  };
+  return { success: true, runDateStr, processedCount: processedMobiles.size, queuedMessages: queued };
 }
 
 if (require.main === module) {

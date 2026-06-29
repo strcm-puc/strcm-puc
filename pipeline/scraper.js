@@ -291,6 +291,15 @@ async function scrapeYesterdaySales() {
         } catch (tgErr) {
           console.warn(`[scraper] PENDING: ${partyCode} — Telegram alert FAILED: ${tgErr.message}`);
         }
+        await db.collection('pending_party_codes').doc(partyCode).set({
+          party_code:  partyCode,
+          party_name:  partyName,
+          bill_no:     billNo,
+          bill_value:  billValue,
+          scrape_date: dateFmt,
+          status:      'pending',
+          alerted_at:  new Date().toISOString(),
+        }).catch(e => console.warn(`[scraper] pending_party_codes/${partyCode} write failed: ${e.message}`));
         continue;
       }
 

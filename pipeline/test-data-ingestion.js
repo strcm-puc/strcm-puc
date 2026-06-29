@@ -165,7 +165,7 @@ const transactions = [
     id_type:    'ab_id',
     items:      [],
   },
-  // Case 2 — AB ID hitting target: Layer 1 + Layer 2 (target) + Layer 3 (loyalty)
+  // Case 2 — AB ID (above target threshold): Layer 1 only — L2/L3 deferred to period-end
   {
     bill_no:    'B002',
     date:       '27-06-2026',
@@ -223,21 +223,19 @@ async function runTest() {
   await ingestTransactions(transactions);
 
   // ── Expected values ──────────────────────────────────────────────────────────
+  // Layer 2/3 bonuses are now deferred to checkPeriodEndBonus (period-end only).
+  // data-ingestion.js writes Layer 1 (base 1%) only.
+  //
   // Case 1: B001, AB001, ₹1000
   //   L1 = floor(1000 * 0.01) = 10
-  //   L2 = skipped (1000 < 5000)
-  //   L3 = skipped (0 < 3 months)
   //   expected balance = 10
   //
   // Case 2: B002, AB002, ₹6000
   //   L1 = floor(6000 * 0.01) = 60
-  //   L2 = floor((6000 - 5000) * 0.005) = floor(5) = 5
-  //   L3 = floor(6/3) * 2 = 4
-  //   expected balance = 69
+  //   expected balance = 60   ← L2/L3 deferred to period-end
   //
   // Case 3: B003, 6012345, ₹2000
   //   L1 = floor(2000 * 0.01) = 20
-  //   L2/L3 = skipped (Display Wall, C7)
   //   expected balance = 20
   //
   // Case 4: B001 duplicate → skipped, no extra credits applied
@@ -268,7 +266,7 @@ async function runTest() {
   let allPass = true;
   allPass &= check('Case 1 — AB ID under target   | balance (AB001)', b1, 10);
   allPass &= check('Case 1 — purchase_summary rows', ps1, 1);
-  allPass &= check('Case 2 — AB ID hitting target  | balance (AB002)', b2, 69);
+  allPass &= check('Case 2 — AB ID hitting target  | balance (AB002)', b2, 60);
   allPass &= check('Case 2 — purchase_summary rows', ps2, 1);
   allPass &= check('Case 3 — Display Wall          | balance (6012345)', b3, 20);
   allPass &= check('Case 3 — purchase_summary rows', ps3, 1);
