@@ -157,9 +157,9 @@ async function scrapeYesterdaySales() {
     await page.waitForSelector('.ant-picker-dropdown', { timeout: 8000 });
     await page.waitForTimeout(300);
 
-    // Select yesterday using its exact ISO title attribute — unambiguous, never matches
-    // a disabled future-month cell, works correctly on every date forever.
-    const yesterdayCell = page.locator(`td[title="${dateIso}"]`);
+    // Scope to ant-picker-cell-in-view to avoid strict-mode violation when the calendar
+    // grid shows the same date in both the current month and an adjacent month's overflow row.
+    const yesterdayCell = page.locator(`td.ant-picker-cell-in-view[title="${dateIso}"]`);
     await yesterdayCell.click();         // click 1: sets start date
     await page.waitForTimeout(400);
     await yesterdayCell.click();         // click 2: sets end date = same day, closes picker
