@@ -13,6 +13,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google/genai": "^2.10.0",
     "firebase-admin": "^13.4.0",
     "playwright": "^1.61.1",
     "xlsx": "^0.18.5"

@@ -2,6 +2,9 @@
 
 // ════════════════════════════════════════════════════════════════════════════════
 // reward-calculator.js — full test suite for the bracket-based reward formula.
+// Storage layout: customers/{mobile}/ids/{id}/periods/{fiscalKey} — fiscalKey is
+// a pure relabeling of the same calendar period (see customer-schema.js), so the
+// expected values below are completely unchanged from before the restructure.
 //
 // AB ID tests (monthly):
 //   A: Missed bracket (spending < 90% of avg) → 0 bonus, cons_months reset to 0
@@ -25,7 +28,7 @@
 // Message budget:
 //   P: Budget exhausted → zero Claude calls, no briefing
 //
-// Total Claude calls across all tests: exactly 1 (Test A's decideDailyMessage
+// Total Claude calls across all tests: exactly 1 (Test Q's decideDailyMessage
 // call — only test that exercises that path at all; setPeriodTarget and
 // checkPeriodEndBonus never call Claude under the new formula).
 // ════════════════════════════════════════════════════════════════════════════════
@@ -33,7 +36,7 @@
 const pathMod = require('path');
 const { EventEmitter } = require('events');
 
-// ── In-memory Firestore mock ───────────────────────────────────────────────────
+// ── In-memory Firestore mock — a generic path-keyed store, structure-agnostic ──
 
 function makeStore() {
   const store = new Map();
@@ -49,6 +52,22 @@ function makeStore() {
         store.set(docPath, opts?.merge
           ? { ...(store.get(docPath) ?? {}), ...data }
           : data);
+      },
+      update: async (data) => {
+        const existing = store.get(docPath) ?? {};
+        const updated  = { ...existing };
+        for (const [key, value] of Object.entries(data)) {
+          if (key.includes('.')) {
+            const parts = key.split('.');
+            let obj = updated;
+            for (let i = 0; i < parts.length - 1; i++) {
+              if (typeof obj[parts[i]] !== 'object' || obj[parts[i]] === null) obj[parts[i]] = {};
+              obj = obj[parts[i]];
+            }
+            obj[parts[parts.length - 1]] = value;
+          } else { updated[key] = value; }
+        }
+        store.set(docPath, updated);
       },
       collection: (sub) => makeCollectionRef(`${docPath}/${sub}`),
     };
@@ -101,12 +120,20 @@ function makeStore() {
         },
       }),
       get: async () => {
+        // Real Firestore allows "phantom" parent docs — a doc is addressable purely
+        // by having a subcollection beneath it, even with no data set on it directly.
+        // Dedupe on the immediate child segment so deeply-nested-only docs still show up.
         const prefix = colPath + '/';
-        const docs   = [];
-        for (const [k, v] of store) {
-          if (!k.startsWith(prefix) || k.slice(prefix.length).includes('/')) continue;
-          docs.push({ id: k.split('/').pop(), data: () => v });
+        const seen   = new Map(); // immediate child id -> full doc path
+        for (const k of store.keys()) {
+          if (!k.startsWith(prefix)) continue;
+          const rest = k.slice(prefix.length);
+          const id   = rest.split('/')[0];
+          if (!seen.has(id)) seen.set(id, `${prefix}${id}`);
         }
+        const docs = [...seen.entries()].map(([id, docPath]) => ({
+          id, data: () => store.get(docPath) ?? {}, ref: makeDocRef(docPath),
+        }));
         return { docs };
       },
     };
@@ -189,30 +216,62 @@ injectMock(pathMod.join(ROOT, 'vault-read.js'), {
   },
 });
 
+// checkPeriodEndBonus's Gemini aggregation pass (period-aggregator.js) calls Gemini
+// via the @google/genai Vertex SDK, not raw https — mock that SDK directly so these
+// tests never make a real network/API call.
+let geminiAggCallCount = 0;
+injectMock(require.resolve('@google/genai'), {
+  GoogleGenAI: class {
+    constructor() {}
+    get models() {
+      return {
+        generateContent: async () => {
+          geminiAggCallCount++;
+          return { text: JSON.stringify({ summary: 'Test period summary.' }) };
+        },
+      };
+    }
+  },
+});
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function freshRC(store, mockDb, mockAdmin) {
   injectMock(pathMod.join(ROOT, 'firebase-config.js'), { db: mockDb, admin: mockAdmin });
   delete require.cache[require.resolve('./reward-calculator')];
   delete require.cache[require.resolve('./ledger-writer')];
+  delete require.cache[require.resolve('./customer-schema')];
+  delete require.cache[require.resolve('./period-aggregator')];
   return require('./reward-calculator');
 }
 
+const { fiscalPeriodKey } = (() => {
+  // customer-schema.js only needs a working `db.collection` at require time to not
+  // throw — give it a harmless stub for this one-time key-format helper import.
+  injectMock(pathMod.join(ROOT, 'firebase-config.js'), { db: { collection: () => ({}) }, admin: {} });
+  delete require.cache[require.resolve('./customer-schema')];
+  return require('./customer-schema');
+})();
+
 // Seed AB ID customer with purchase history expressed as { 'YYYY-MM': amount } map.
 function seedAbHistory(store, mobile, historyMap, opts = {}) {
+  const rawIds = opts.linkedIds ?? ['AB_TEST'];
   store.set(`customers/${mobile}`, {
     profile: {
-      linked_ids:         opts.linkedIds  ?? ['AB_TEST'],
+      linked_ids:         rawIds.map(id => ({ id, type: 'ab_id' })),
       name:               opts.name       ?? 'Test Customer',
       gender:             opts.gender     ?? 'unknown',
       tier:               opts.tier       ?? 'Saathi',
       consecutive_months: opts.consecutive ?? 0,
     },
   });
+  const primaryId = rawIds[0];
   let i = 0;
   for (const [period, amount] of Object.entries(historyMap)) {
-    store.set(`customers/${mobile}/purchase_summary/h${i++}`, {
-      date:   period + '-15',
+    const dateStr    = period + '-15';
+    const storageKey = fiscalPeriodKey(new Date(dateStr), false);
+    store.set(`customers/${mobile}/ids/${primaryId}/periods/${storageKey}/purchases/h${i++}`, {
+      date:   dateStr,
       amount: String(amount),
     });
   }
@@ -222,23 +281,45 @@ function seedAbHistory(store, mobile, historyMap, opts = {}) {
 function seedDwHistory(store, mobile, historyMap, opts = {}) {
   // Map quarter keys to representative dates so fetchPurchaseHistory groups them correctly
   const qToDate = { 'Q1': '-02-15', 'Q2': '-05-15', 'Q3': '-08-15', 'Q4': '-11-15' };
+  const rawIds = opts.linkedIds ?? ['6099001'];
   store.set(`customers/${mobile}`, {
     profile: {
-      linked_ids:         opts.linkedIds  ?? ['6099001'],
+      linked_ids:         rawIds.map(id => ({ id, type: 'display_wall' })),
       name:               opts.name       ?? 'DW Customer',
       gender:             opts.gender     ?? 'unknown',
       tier:               opts.tier       ?? 'Saathi',
       consecutive_months: 0,
     },
   });
+  const primaryId = rawIds[0];
   let i = 0;
   for (const [period, amount] of Object.entries(historyMap)) {
-    const [yr, q] = period.split('-');
-    store.set(`customers/${mobile}/purchase_summary/h${i++}`, {
-      date:   yr + qToDate[q],
+    const [yr, q]    = period.split('-');
+    const dateStr    = yr + qToDate[q];
+    const storageKey = fiscalPeriodKey(new Date(dateStr), true);
+    store.set(`customers/${mobile}/ids/${primaryId}/periods/${storageKey}/purchases/h${i++}`, {
+      date:   dateStr,
       amount: String(amount),
     });
   }
+}
+
+// Writes a target doc at the new nested path: customers/{mobile}/ids/{id}/periods/{storageKey}.target
+function writeTarget(store, mobile, idUsed, storageKey, fields) {
+  const path = `customers/${mobile}/ids/${idUsed}/periods/${storageKey}`;
+  store.set(path, { ...(store.get(path) ?? {}), target: fields });
+}
+
+// Reads back the merged target+bonus object (checkPeriodEndBonus writes bracket/bonus_rs
+// etc. into the SAME target field, merging with whatever setPeriodTarget already wrote).
+function readPeriod(store, mobile, idUsed, storageKey) {
+  return store.get(`customers/${mobile}/ids/${idUsed}/periods/${storageKey}`);
+}
+function readBonus(store, mobile, idUsed, storageKey) {
+  return readPeriod(store, mobile, idUsed, storageKey)?.target;
+}
+function readLedgerBalance(store, mobile, idUsed) {
+  return store.get(`customers/${mobile}/ids/${idUsed}`)?.current_balance;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -260,7 +341,7 @@ async function runTestA() {
   }, { consecutive: 5 });
 
   // Rolling avg = 10000. missedThreshold = 9000. 8000 < 9000 → Missed.
-  store.set(`customers/${mobile}/period_targets/2026-06`, {
+  writeTarget(store, mobile, 'AB_TEST', 'FY2627-06', {
     period_key:       '2026-06',
     target_amount:    10500,
     rolling_average:  10000,
@@ -274,7 +355,7 @@ async function runTestA() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus   = store.get(`customers/${mobile}/period_bonuses/2026-06`);
+  const bonus   = readBonus(store, mobile, 'AB_TEST', 'FY2627-06');
   const profile = store.get(`customers/${mobile}`);
   const consAfter = profile?.profile?.consecutive_months ?? -1;
 
@@ -306,7 +387,7 @@ async function runTestB() {
     '2026-06': 9500,
   }, { consecutive: 1 });  // newConsecutive=2 → no loyalty top-up this month
 
-  store.set(`customers/${mobile}/period_targets/2026-06`, {
+  writeTarget(store, mobile, 'AB_TEST', 'FY2627-06', {
     period_key:       '2026-06',
     target_amount:    10500,
     rolling_average:  10000,
@@ -320,7 +401,7 @@ async function runTestB() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus   = store.get(`customers/${mobile}/period_bonuses/2026-06`);
+  const bonus   = readBonus(store, mobile, 'AB_TEST', 'FY2627-06');
   const profile = store.get(`customers/${mobile}`);
 
   const expectedBonus = Math.floor(9500 * 0.005); // 47
@@ -358,7 +439,7 @@ async function runTestC() {
     '2026-06': 12000,
   }, { consecutive: 1 });
 
-  store.set(`customers/${mobile}/period_targets/2026-06`, {
+  writeTarget(store, mobile, 'AB_TEST', 'FY2627-06', {
     period_key:       '2026-06',
     target_amount:    10500,
     rolling_average:  10000,
@@ -372,9 +453,9 @@ async function runTestC() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus       = store.get(`customers/${mobile}/period_bonuses/2026-06`);
+  const bonus       = readBonus(store, mobile, 'AB_TEST', 'FY2627-06');
   const expectedBonus = Math.floor(12000 * 0.015);  // 180
-  const ledger      = store.get(`customers/${mobile}/st_rupees_ledger/AB_TEST`);
+  const ledgerBal    = readLedgerBalance(store, mobile, 'AB_TEST');
 
   return {
     name:        'C — AB ID Growth (12000 ≥ 10500)',
@@ -382,11 +463,11 @@ async function runTestC() {
     bracket:     bonus?.bracket,
     bonusRs:     bonus?.bonus_rs,
     expectedBonus,
-    ledgerBal:   ledger?.current_balance,
+    ledgerBal,
     pass: callsThisTest === 0 &&
           bonus?.bracket === 'growth' &&
           bonus?.bonus_rs === expectedBonus &&
-          ledger?.current_balance === expectedBonus,
+          ledgerBal === expectedBonus,
   };
 }
 
@@ -409,7 +490,7 @@ async function runTestD() {
     '2026-06': 12000,
   }, { consecutive: 2 });   // was 2, this month brings it to 3
 
-  store.set(`customers/${mobile}/period_targets/2026-06`, {
+  writeTarget(store, mobile, 'AB_TEST', 'FY2627-06', {
     period_key:       '2026-06',
     target_amount:    10500,
     rolling_average:  10000,
@@ -423,8 +504,8 @@ async function runTestD() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus          = store.get(`customers/${mobile}/period_bonuses/2026-06`);
-  const ledger         = store.get(`customers/${mobile}/st_rupees_ledger/AB_TEST`);
+  const bonus          = readBonus(store, mobile, 'AB_TEST', 'FY2627-06');
+  const ledgerBal       = readLedgerBalance(store, mobile, 'AB_TEST');
   const profile        = store.get(`customers/${mobile}`);
 
   // Pre-cap values
@@ -447,7 +528,7 @@ async function runTestD() {
     bracket:        bonus?.bracket,
     bonusRs:        bonus?.bonus_rs,
     loyaltyTopupRs: bonus?.loyalty_topup_rs,
-    ledgerBal:      ledger?.current_balance,
+    ledgerBal,
     expectedBonusRs,
     expectedLoyalty,
     expectedTotal,
@@ -457,80 +538,43 @@ async function runTestD() {
           bonus?.capped  === true &&
           bonus?.bonus_rs === expectedBonusRs &&
           bonus?.loyalty_topup_rs === expectedLoyalty &&
-          ledger?.current_balance === expectedTotal &&
+          ledgerBal === expectedTotal &&
           consAfter === 3,
   };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // TEST E — 3% absolute ceiling: L1(est) + Growth bonus must not exceed 3%
-// genuine_sales = 10000. L1 est = 100. Growth bonus = floor(10000*0.015) = 150.
-// L1+bonus = 250. abs3pct = floor(10000*0.03) = 300. 250 ≤ 300 → NOT capped here.
-// Use a case where it DOES cap: genuine_sales = 10000, but inject a loyalty top-up
-// that pushes over. consecutive=5 (month 6 completes streak, loyalty fires).
-// prev 2 months = 10000 each. combined3 = 30000. loyalty = 150.
-// L1(100) + growth(150) + loyalty(150) = 400 > 300 → cap kicks in.
-// allowed = 300-100=200. growth_capped = floor(150*200/300)=100. loyalty_capped=floor(150*200/300)=100.
-// Total credited = 200.
+// genuine_sales = 5300, prev2 months = 45000 each, rolling avg established at 5000.
+// L1(53) + growth(79) + loyalty(476) = 608 > floor(5300*0.03)=159 → capped.
+// allowed=159-53=106. bonus_capped=floor(79*106/555)=15. loyalty_capped=floor(476*106/555)=90.
 // ══════════════════════════════════════════════════════════════════════════════
 async function runTestE() {
   const { store, mockDb, mockAdmin } = makeStore();
   const rc = freshRC(store, mockDb, mockAdmin);
   rc._setNow(() => new Date('2026-06-30'));
 
-  const mobile = '7001000005';
-  seedAbHistory(store, mobile, {
-    '2026-01': 10000,
-    '2026-02': 10000,
-    '2026-03': 10000,
-    '2026-04': 10000,
-    '2026-05': 10000,
-    '2026-06': 10000,  // Growth (≥105% since avg=10000, growth=10500)... wait.
-  }, { consecutive: 5 });
-
-  // avg of last 3 = 10000. growthThreshold = 10500. 10000 < 10500 → Maintenance, not Growth.
-  // Let me use Maintenance here: bonus = floor(10000*0.005)=50. loyalty=floor(30000*0.005)=150.
-  // L1(100)+50+150=300. abs3pct=300. 300 ≤ 300 → NOT capped. Need to push harder.
-  // Use genuine_sales=9500 (Maintenance): bonus=47, loyalty=floor(28500*0.005)=142.
-  // L1(95)+47+142=284 ≤ 285. Still not capped.
-  // The ceiling is hard to hit at these rates. Let's use a different approach:
-  // force it with a tiny genuine_sales where the percentages stack up.
-  // genuine_sales=100: Maintenance bonus=0 (floor(100*0.005)=0). Won't work.
-  // The 3% ceiling requires L1+bonus+loyalty > 3% which needs loyalty to be large.
-  // Easiest: override with a period_targets that says growth and large prev history.
-  // Use genuine_sales=5000, prev2=45000+45000=90000, combined3=95000, loyalty=475.
-  // L1(50)+growth(75)+loyalty(475)=600 > floor(5000*0.03)=150. Capped.
-  // allowed=150-50=100. growth_capped=floor(75*100/550)=13. loyalty_capped=floor(475*100/550)=86.
-
-  // Re-seed for this scenario
-  const { store: s2, mockDb: db2, mockAdmin: a2 } = makeStore();
-  injectMock(pathMod.join(ROOT, 'firebase-config.js'), { db: db2, admin: a2 });
-  delete require.cache[require.resolve('./reward-calculator')];
-  delete require.cache[require.resolve('./ledger-writer')];
-  const rc2 = require('./reward-calculator');
-  rc2._setNow(() => new Date('2026-06-30'));
-
-  const m2 = '7001000005b';
-  s2.set(`customers/${m2}`, {
+  const mobile = '7001000005b';
+  store.set(`customers/${mobile}`, {
     profile: {
-      linked_ids:         ['AB_E'],
+      linked_ids:         [{ id: 'AB_E', type: 'ab_id' }],
       name:               'Cap Test',
       gender:             'unknown',
       tier:               'Saathi',
       consecutive_months: 5,   // will become 6 → loyalty fires
     },
   });
-  // This month: genuine_sales = 5000 (above growthThreshold 5250)
-  s2.set(`customers/${m2}/purchase_summary/cur`, { date: '2026-06-10', amount: '5300' });
+  // This month: genuine_sales = 5300 (above growthThreshold 5250)
+  store.set(`customers/${mobile}/ids/AB_E/periods/FY2627-06/purchases/cur`, { date: '2026-06-10', amount: '5300' });
   // Previous 2 months: 45000 each (so combined3 = 5300+45000+45000=95300)
-  s2.set(`customers/${m2}/purchase_summary/p1`, { date: '2026-04-10', amount: '45000' });
-  s2.set(`customers/${m2}/purchase_summary/p2`, { date: '2026-05-10', amount: '45000' });
+  store.set(`customers/${mobile}/ids/AB_E/periods/FY2627-04/purchases/p1`, { date: '2026-04-10', amount: '45000' });
+  store.set(`customers/${mobile}/ids/AB_E/periods/FY2627-05/purchases/p2`, { date: '2026-05-10', amount: '45000' });
   // And 3 months before that to establish rolling average = 5000
-  s2.set(`customers/${m2}/purchase_summary/r1`, { date: '2026-03-10', amount: '5000' });
-  s2.set(`customers/${m2}/purchase_summary/r2`, { date: '2026-02-10', amount: '5000' });
-  s2.set(`customers/${m2}/purchase_summary/r3`, { date: '2026-01-10', amount: '5000' });
+  store.set(`customers/${mobile}/ids/AB_E/periods/FY2627-03/purchases/r1`, { date: '2026-03-10', amount: '5000' });
+  store.set(`customers/${mobile}/ids/AB_E/periods/FY2627-02/purchases/r2`, { date: '2026-02-10', amount: '5000' });
+  store.set(`customers/${mobile}/ids/AB_E/periods/FY2627-01/purchases/r3`, { date: '2026-01-10', amount: '5000' });
 
-  s2.set(`customers/${m2}/period_targets/2026-06`, {
+  writeTarget(store, mobile, 'AB_E', 'FY2627-06', {
     period_key:       '2026-06',
     target_amount:    5250,
     rolling_average:  5000,
@@ -541,11 +585,11 @@ async function runTestE() {
   });
 
   const callsBefore = claudeCallCount;
-  await rc2.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
+  await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus      = s2.get(`customers/${m2}/period_bonuses/2026-06`);
-  const ledger     = s2.get(`customers/${m2}/st_rupees_ledger/AB_E`);
+  const bonus  = readBonus(store, mobile, 'AB_E', 'FY2627-06');
+  const ledgerBal = readLedgerBalance(store, mobile, 'AB_E');
 
   // genuine_sales=5300, growth_threshold=5250 → Growth bracket.
   // Pre-cap: bonus=floor(5300*0.015)=79, combined3=5300+45000+45000=95300,
@@ -570,7 +614,7 @@ async function runTestE() {
     capped:       bonus?.capped,
     bonusRs:      bonus?.bonus_rs,
     loyaltyRs:    bonus?.loyalty_topup_rs,
-    ledgerBal:    ledger?.current_balance,
+    ledgerBal,
     expectedBonus,
     expectedLoyalty,
     expectedTotal,
@@ -578,7 +622,7 @@ async function runTestE() {
           bonus?.capped === true &&
           bonus?.bonus_rs === expectedBonus &&
           bonus?.loyalty_topup_rs === expectedLoyalty &&
-          ledger?.current_balance === expectedTotal,
+          ledgerBal === expectedTotal,
   };
 }
 
@@ -588,7 +632,7 @@ async function runTestE() {
 // rawAvg of last 3 periods: Mar=10000, Apr=10000, May=2000 → rawAvg=7333.
 // 80% floor: May floor = max(2000, round(7333*0.8)) = max(2000,5867) = 5867.
 // floored avg = (10000+10000+5867)/3 = round(8622) = 8622.
-// Expected: period_targets/2026-07 has rolling_average=8622, NOT 7333.
+// Expected: July's target doc has rolling_average=8622, NOT 7333.
 // ══════════════════════════════════════════════════════════════════════════════
 async function runTestF() {
   const { store, mockDb, mockAdmin } = makeStore();
@@ -607,7 +651,7 @@ async function runTestF() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-07-02'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const target = store.get(`customers/${mobile}/period_targets/2026-07`);
+  const target = readBonus(store, mobile, 'AB_TEST', 'FY2627-07');
 
   // raw3 = [10000, 10000, 2000], rawAvg = 7333.33
   const rawAvg   = (10000 + 10000 + 2000) / 3;
@@ -638,12 +682,12 @@ async function runTestG() {
   const mobile = '7001000007';
   // No purchase history at all → cold-start month 1
   store.set(`customers/${mobile}`, {
-    profile: { linked_ids: ['AB_G'], name: 'New', gender: 'unknown', tier: 'Saathi', consecutive_months: 0 },
+    profile: { linked_ids: [{ id: 'AB_G', type: 'ab_id' }], name: 'New', gender: 'unknown', tier: 'Saathi', consecutive_months: 0 },
   });
   // June purchases (high spend — bonus should still be 0)
-  store.set(`customers/${mobile}/purchase_summary/p1`, { date: '2026-06-10', amount: '50000' });
+  store.set(`customers/${mobile}/ids/AB_G/periods/FY2627-06/purchases/p1`, { date: '2026-06-10', amount: '50000' });
 
-  store.set(`customers/${mobile}/period_targets/2026-06`, {
+  writeTarget(store, mobile, 'AB_G', 'FY2627-06', {
     period_key:       '2026-06',
     target_amount:    0,
     rolling_average:  0,
@@ -657,7 +701,7 @@ async function runTestG() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus = store.get(`customers/${mobile}/period_bonuses/2026-06`);
+  const bonus = readBonus(store, mobile, 'AB_G', 'FY2627-06');
 
   return {
     name:        'G — Cold-start M1: bonus=0 regardless of spend',
@@ -684,7 +728,7 @@ async function runTestH() {
     '2026-06': 4000,
   }, { consecutive: 0 });
 
-  store.set(`customers/${mobile}/period_targets/2026-06`, {
+  writeTarget(store, mobile, 'AB_TEST', 'FY2627-06', {
     period_key:       '2026-06',
     target_amount:    3200,   // 3000 + 200
     rolling_average:  0,
@@ -698,7 +742,7 @@ async function runTestH() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus         = store.get(`customers/${mobile}/period_bonuses/2026-06`);
+  const bonus         = readBonus(store, mobile, 'AB_TEST', 'FY2627-06');
   const expectedBonus = Math.floor(4000 * 0.005); // 20
 
   return {
@@ -727,7 +771,7 @@ async function runTestI() {
     '2026-06': 2500,  // M3 actual — misses 3200 target
   }, { consecutive: 0 });
 
-  store.set(`customers/${mobile}/period_targets/2026-06`, {
+  writeTarget(store, mobile, 'AB_TEST', 'FY2627-06', {
     period_key:       '2026-06',
     target_amount:    3200,   // M2 actual (3000) + 200
     rolling_average:  0,
@@ -741,7 +785,7 @@ async function runTestI() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus = store.get(`customers/${mobile}/period_bonuses/2026-06`);
+  const bonus = readBonus(store, mobile, 'AB_TEST', 'FY2627-06');
 
   return {
     name:        'I — Cold-start M3: miss target → 1% only, bonus=0',
@@ -769,7 +813,7 @@ async function runTestJ() {
     '2026-Q2': 9000,   // actual this quarter
   });
 
-  store.set(`customers/${mobile}/period_targets/2026-Q2`, {
+  writeTarget(store, mobile, '6099001', 'FY2627-Q1', {
     period_key:        '2026-Q2',
     target_amount:     11000,
     rolling_average:   10000,
@@ -782,7 +826,7 @@ async function runTestJ() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus = store.get(`customers/${mobile}/period_bonuses/2026-Q2`);
+  const bonus = readBonus(store, mobile, '6099001', 'FY2627-Q1');
 
   return {
     name:        'J — DW Missed (9000 < 11000)',
@@ -811,7 +855,7 @@ async function runTestK() {
     '2026-Q2': 12000,
   });
 
-  store.set(`customers/${mobile}/period_targets/2026-Q2`, {
+  writeTarget(store, mobile, '6099001', 'FY2627-Q1', {
     period_key:        '2026-Q2',
     target_amount:     11000,
     rolling_average:   10000,
@@ -824,7 +868,7 @@ async function runTestK() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus         = store.get(`customers/${mobile}/period_bonuses/2026-Q2`);
+  const bonus         = readBonus(store, mobile, '6099001', 'FY2627-Q1');
   const expectedBonus = Math.floor(12000 * 0.015); // 180
 
   return {
@@ -855,7 +899,7 @@ async function runTestL() {
     '2026-Q2': 12000,
   });
 
-  store.set(`customers/${mobile}/period_targets/2026-Q2`, {
+  writeTarget(store, mobile, '6099001', 'FY2627-Q1', {
     period_key:        '2026-Q2',
     target_amount:     11000,
     rolling_average:   10000,
@@ -868,7 +912,7 @@ async function runTestL() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const bonus         = store.get(`customers/${mobile}/period_bonuses/2026-Q2`);
+  const bonus         = readBonus(store, mobile, '6099001', 'FY2627-Q1');
   const expectedBonus = Math.floor(12000 * 0.02); // 240
 
   return {
@@ -907,7 +951,7 @@ async function runTestM() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-04-02'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const target = store.get(`customers/${mobile}/period_targets/2026-Q2`);
+  const target = readBonus(store, mobile, '6099001', 'FY2627-Q1');
 
   const rawAvg   = (10000 + 10000 + 2000) / 3;
   const floor70  = Math.round(rawAvg * 0.70);
@@ -947,14 +991,14 @@ async function runTestN() {
   seedDwHistory(store, mobile, {
     '2025-Q2': 10000,
     '2025-Q3': 10000,
-    // Q4 intentionally omitted (no purchase_summary entries for it)
+    // Q4 intentionally omitted (no purchase entries for it)
   });
 
   const callsBefore = claudeCallCount;
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-04-02'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const target = store.get(`customers/${mobile}/period_targets/2026-Q2`);
+  const target = readBonus(store, mobile, '6099001', 'FY2627-Q1');
   const baselineAvg      = (10000 + 10000) / 2;       // 10000
   const expectedTarget   = Math.round(baselineAvg * 1.08); // 10800
 
@@ -990,7 +1034,7 @@ async function runTestO() {
   await rc.runNightlyRewardChecks(new Map(), new Date('2026-04-02'));
   const callsThisTest = claudeCallCount - callsBefore;
 
-  const target          = store.get(`customers/${mobile}/period_targets/2026-Q2`);
+  const target          = readBonus(store, mobile, '6099001', 'FY2627-Q1');
   const expectedTarget  = Math.round(8000 * 1.08); // 8640
 
   return {
@@ -1023,7 +1067,7 @@ async function runTestP() {
     '2026-05': 10000,
   }, { consecutive: 4 });
 
-  store.set(`customers/${mobile}/period_targets/2026-06`, {
+  writeTarget(store, mobile, 'AB_TEST', 'FY2627-06', {
     period_key:    '2026-06',
     target_amount: 10500,
     rolling_average:  10000,
@@ -1032,8 +1076,10 @@ async function runTestP() {
     missed_threshold: 9000,
     growth_threshold: 10500,
   });
-  store.set(`customers/${mobile}/message_budget/2026-06`, {
-    period_key: '2026-06', sent: 12, max_allowed: 12, tier: 'Saathi',
+  const periodPath = `customers/${mobile}/ids/AB_TEST/periods/FY2627-06`;
+  store.set(periodPath, {
+    ...(store.get(periodPath) ?? {}),
+    message_budget: { period_key: '2026-06', sent: 12, max_allowed: 12, tier: 'Saathi' },
   });
 
   const callsBefore = claudeCallCount;
@@ -1067,7 +1113,7 @@ async function runTestQ() {
     '2026-05': 10000,
   }, { consecutive: 2 });
 
-  store.set(`customers/${mobile}/period_targets/2026-06`, {
+  writeTarget(store, mobile, 'AB_TEST', 'FY2627-06', {
     period_key:    '2026-06',
     target_amount: 10500,
     rolling_average:  10000,
@@ -1159,6 +1205,7 @@ async function run() {
   const totalCalls = claudeCallCount;
   const callsOk    = totalCalls === 1;  // Only Test Q calls Claude
   console.log(`\n  ${callsOk ? '✓' : '✗'}  Total Claude calls across all 17 tests: ${totalCalls} (expected exactly 1)`);
+  console.log(`  ${geminiAggCallCount > 0 ? '✓' : '✗'}  Gemini aggregation calls (mocked, period-aggregator.js): ${geminiAggCallCount}`);
 
   console.log('\n──────────────────────────────────────────────────────────────────');
   console.log(allPass && callsOk ? '  ALL TESTS PASSED ✓' : '  SOME TESTS FAILED ✗');

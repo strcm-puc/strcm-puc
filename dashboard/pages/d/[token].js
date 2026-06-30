@@ -20,15 +20,11 @@ export default function DashboardTokenPage({ data }) {
 
 // ── Firestore helpers (server-side only) ──────────────────────────────────────
 
-function _toMs(d) {
-  if (!d) return null;
-  if (typeof d.toDate === 'function') return d.toDate().getTime();
-  const t = new Date(d).getTime();
-  return isNaN(t) ? null : t;
-}
-
 export async function getServerSideProps({ params }) {
   const { db } = require('../../../firebase-config');
+  const { idRef, purchasesCol, fiscalPeriodKey } = require('../../../pipeline/customer-schema');
+  const { getPeriodBounds } = require('../../../pipeline/reward-calculator');
+  const { getCustomerProgress } = require('../../../pipeline/customer-progress');
   const { token } = params;
 
   const snap = await db.collection('customers')
@@ -41,82 +37,65 @@ export async function getServerSideProps({ params }) {
   const doc = snap.docs[0];
   const mobile = doc.id;
   const profile = doc.data().profile ?? {};
-  const linkedIds = (profile.linked_ids ?? []).map(String);
+  const linkedIds = profile.linked_ids ?? []; // [{id, type}]
 
-  const abIds = linkedIds.filter(id => !id.startsWith('60'));
-  const dwIds = linkedIds.filter(id => id.startsWith('60'));
+  const abIds = linkedIds.filter(li => li.type === 'ab_id').map(li => li.id);
+  const dwIds = linkedIds.filter(li => li.type === 'display_wall').map(li => li.id);
 
   const now = new Date();
-  const y = now.getFullYear();
-  const m = now.getMonth();
-  const abPeriodKey = `${y}-${String(m + 1).padStart(2, '0')}`;
-  const q = Math.floor(m / 3) + 1;
-  const dwPeriodKey = `${y}-Q${q}`;
+  const { start: abPeriodStart } = getPeriodBounds(now, false);
+  const { start: dwPeriodStart } = getPeriodBounds(now, true);
+  const abStorageKey = fiscalPeriodKey(abPeriodStart, false);
+  const dwStorageKey = fiscalPeriodKey(dwPeriodStart, true);
 
-  const monthStart = new Date(y, m, 1).getTime();
-  const monthEnd   = new Date(y, m + 1, 1).getTime();
-  const qStart     = new Date(y, (q - 1) * 3, 1).getTime();
-  const qEnd       = new Date(y, q * 3, 1).getTime();
-
-  const custRef = db.collection('customers').doc(mobile);
-
-  const [ledgerSnaps, purchaseSnap, abTargetSnap, dwTargetSnap] = await Promise.all([
-    Promise.all(linkedIds.map(id => custRef.collection('st_rupees_ledger').doc(id).get())),
-    custRef.collection('purchase_summary').get(),
-    abIds.length > 0 ? custRef.collection('period_targets').doc(abPeriodKey).get() : Promise.resolve(null),
-    dwIds.length > 0 ? custRef.collection('period_targets').doc(dwPeriodKey).get() : Promise.resolve(null),
+  const [ledgerSnaps, abPurchaseSnaps, dwPurchaseSnaps, abTargetSnap, dwTargetSnap] = await Promise.all([
+    Promise.all(linkedIds.map(li => idRef(mobile, li.id).get())),
+    Promise.all(abIds.map(id => purchasesCol(mobile, id, abStorageKey).get())),
+    Promise.all(dwIds.map(id => purchasesCol(mobile, id, dwStorageKey).get())),
+    abIds[0] ? idRef(mobile, abIds[0]).collection('periods').doc(abStorageKey).get() : Promise.resolve(null),
+    dwIds[0] ? idRef(mobile, dwIds[0]).collection('periods').doc(dwStorageKey).get() : Promise.resolve(null),
   ]);
 
-  // Aggregate ledger totals
-  let lifetimeEarned = 0, lifetimeRedeemed = 0, available = 0;
-  const ledgerById = {};
+  // Aggregate ledger totals (current_balance only — lifetime_earned/redeemed are
+  // derived elsewhere via customer-progress.js, not needed for this dashboard view)
+  let available = 0;
+  const balanceById = {};
   for (let i = 0; i < linkedIds.length; i++) {
     if (ledgerSnaps[i].exists) {
       const d = ledgerSnaps[i].data();
-      lifetimeEarned   += Number(d.lifetime_earned   ?? 0);
-      lifetimeRedeemed += Number(d.lifetime_redeemed ?? 0);
-      available        += Number(d.current_balance   ?? 0);
-      ledgerById[linkedIds[i]] = d;
+      available += Number(d.current_balance ?? 0);
+      balanceById[linkedIds[i].id] = Number(d.current_balance ?? 0);
     }
   }
 
-  // Sum purchases by period
-  const abIdSet = new Set(abIds);
-  const dwIdSet = new Set(dwIds);
+  // Sum purchases — current period only, already scoped to the right id+period folder
   let abPurchases = 0, dwPurchases = 0;
-
-  for (const p of purchaseSnap.docs) {
-    const pd = p.data();
-    const ms = _toMs(pd.date);
-    const amt = Number(pd.amount ?? 0);
-    const uid = String(pd.id_used ?? '');
-    if (abIdSet.has(uid) && ms !== null && ms >= monthStart && ms < monthEnd) abPurchases += amt;
-    if (dwIdSet.has(uid) && ms !== null && ms >= qStart     && ms < qEnd)     dwPurchases += amt;
-  }
+  for (const s of abPurchaseSnaps) for (const p of s.docs) abPurchases += Number(p.data().amount ?? 0);
+  for (const s of dwPurchaseSnaps) for (const p of s.docs) dwPurchases += Number(p.data().amount ?? 0);
 
   // AB target
-  const abThreshold = abTargetSnap?.exists ? Number(abTargetSnap.data().growth_threshold ?? 0) : 0;
+  const abTarget    = abTargetSnap?.exists ? (abTargetSnap.data().target ?? {}) : {};
+  const abThreshold = Number(abTarget.growth_threshold ?? 0);
   const abPct       = abThreshold > 0 ? Math.min(Math.round((abPurchases / abThreshold) * 100), 100) : 0;
-  const abBalance   = abIds[0] && ledgerById[abIds[0]] ? Number(ledgerById[abIds[0]].current_balance ?? 0) : 0;
+  const abBalance   = abIds[0] ? (balanceById[abIds[0]] ?? 0) : 0;
 
   // DW target
-  const dwThreshold = dwTargetSnap?.exists ? Number(dwTargetSnap.data().growth_threshold ?? 0) : 0;
+  const dwTarget    = dwTargetSnap?.exists ? (dwTargetSnap.data().target ?? {}) : {};
+  const dwThreshold = Number(dwTarget.growth_threshold ?? 0);
   const dwPct       = dwThreshold > 0 ? Math.min(Math.round((dwPurchases / dwThreshold) * 100), 100) : 0;
-  const dwBalance   = dwIds[0] && ledgerById[dwIds[0]] ? Number(ledgerById[dwIds[0]].current_balance ?? 0) : 0;
+  const dwBalance   = dwIds[0] ? (balanceById[dwIds[0]] ?? 0) : 0;
 
   // Product target (DW only)
   let hasProduct = false, productName = '', productRequired = 0, productPurchased = 0, productPct = 0;
-  if (dwTargetSnap?.exists) {
-    const rec = dwTargetSnap.data().recommended_product;
-    if (rec && rec.product_name) {
-      hasProduct       = true;
-      productName      = String(rec.product_name);
-      productRequired  = Number(rec.quantity_required  ?? 0);
-      productPurchased = Number(rec.quantity_purchased ?? 0);
-      productPct       = productRequired > 0
-        ? Math.min(Math.round((productPurchased / productRequired) * 100), 100)
-        : 0;
-    }
+  const rec = dwTarget.recommended_product;
+  if (rec && rec.product_name) {
+    hasProduct       = true;
+    productName      = String(rec.product_name);
+    productRequired  = Number(rec.quantity_required  ?? 0);
+    productPurchased = Number(rec.quantity_purchased ?? 0);
+    productPct       = productRequired > 0
+      ? Math.min(Math.round((productPurchased / productRequired) * 100), 100)
+      : 0;
   }
 
   // Join date
@@ -129,6 +108,8 @@ export async function getServerSideProps({ params }) {
       joinDate = jd.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
     }
   }
+
+  const progress = await getCustomerProgress(mobile);
 
   const data = {
     name:            profile.name ?? '',
@@ -150,8 +131,8 @@ export async function getServerSideProps({ params }) {
     productRequired,
     productPurchased,
     productPct,
-    lifetimeEarned,
-    lifetimeRedeemed,
+    lifetimeEarned:   progress?.lifetime.earned   ?? 0,
+    lifetimeRedeemed: progress?.lifetime.redeemed ?? 0,
     available,
     joinDate,
   };

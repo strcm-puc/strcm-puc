@@ -85,12 +85,18 @@ function makeStore() {
         }),
       }),
       get: async () => {
+        // Real Firestore allows "phantom" parent docs — addressable purely by having
+        // a subcollection beneath them. Dedupe on the immediate child segment.
         const prefix = colPath + '/';
-        const docs   = [];
-        for (const [k, v] of store) {
-          if (!k.startsWith(prefix) || k.slice(prefix.length).includes('/')) continue;
-          docs.push({ id: k.split('/').pop(), data: () => v });
+        const seen   = new Map();
+        for (const k of store.keys()) {
+          if (!k.startsWith(prefix)) continue;
+          const id = k.slice(prefix.length).split('/')[0];
+          if (!seen.has(id)) seen.set(id, `${prefix}${id}`);
         }
+        const docs = [...seen.entries()].map(([id, docPath]) => ({
+          id, data: () => store.get(docPath) ?? {}, ref: makeDocRef(docPath),
+        }));
         return { docs };
       },
     };
@@ -153,44 +159,60 @@ injectMock(pathMod.join(ROOT, 'vault-read.js'), {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const PERIOD_KEY = '2026-Q2';  // June 2026, runs on a Q2 day
+const PERIOD_KEY = '2026-Q2';   // calendar label (June 2026, runs on a Q2 day)
 
 function freshPL(store, mockDb, mockAdmin) {
   injectMock(pathMod.join(ROOT, 'firebase-config.js'), { db: mockDb, admin: mockAdmin });
   delete require.cache[require.resolve('./product-ledger')];
+  delete require.cache[require.resolve('./customer-schema')];
   const pl = require('./product-ledger');
   // Lock time to June 29, 2026 (Q2)
   pl._setNow(() => new Date('2026-06-29'));
   return pl;
 }
 
-function seedDwCustomer(store, mobile, dwId, periodTargetOverrides = {}) {
+const { fiscalPeriodKey } = (() => {
+  injectMock(pathMod.join(ROOT, 'firebase-config.js'), { db: { collection: () => ({}) }, admin: {} });
+  delete require.cache[require.resolve('./customer-schema')];
+  return require('./customer-schema');
+})();
+const STORAGE_KEY = fiscalPeriodKey(new Date('2026-06-29'), true); // FY2627-Q1
+
+function targetPath(mobile, id) {
+  return `customers/${mobile}/ids/${id}/periods/${STORAGE_KEY}`;
+}
+
+function seedDwCustomer(store, mobile, dwId, targetOverrides = {}) {
   store.set(`customers/${mobile}`, {
-    profile: { linked_ids: [dwId], name: 'DW Test', tier: 'Saathi' },
+    profile: { linked_ids: [{ id: dwId, type: 'display_wall' }], linked_id_values: [dwId], name: 'DW Test', tier: 'Saathi' },
   });
-  store.set(`customers/${mobile}/period_targets/${PERIOD_KEY}`, {
-    period_key:        PERIOD_KEY,
-    growth_threshold:  100000,
-    product_completed: false,
-    recommended_product: {
-      product_name:       'Nitri Charged Man',
-      quantity_required:  20,
-      quantity_purchased: 5,
+  store.set(targetPath(mobile, dwId), {
+    target: {
+      period_key:        PERIOD_KEY,
+      growth_threshold:  100000,
+      product_completed: false,
+      recommended_product: {
+        product_name:       'Nitri Charged Man',
+        quantity_required:  20,
+        quantity_purchased: 5,
+      },
+      ...targetOverrides,
     },
-    ...periodTargetOverrides,
   });
 }
 
 function seedAbCustomer(store, mobile, abId) {
   store.set(`customers/${mobile}`, {
-    profile: { linked_ids: [abId], name: 'AB Test', tier: 'Saathi' },
+    profile: { linked_ids: [{ id: abId, type: 'ab_id' }], linked_id_values: [abId], name: 'AB Test', tier: 'Saathi' },
   });
-  store.set(`customers/${mobile}/period_targets/${PERIOD_KEY}`, {
-    period_key:        PERIOD_KEY,
-    recommended_product: {
-      product_name:       'Nitri Charged Man',
-      quantity_required:  20,
-      quantity_purchased: 5,
+  store.set(targetPath(mobile, abId), {
+    target: {
+      period_key:        PERIOD_KEY,
+      recommended_product: {
+        product_name:       'Nitri Charged Man',
+        quantity_required:  20,
+        quantity_purchased: 5,
+      },
     },
   });
 }
@@ -205,11 +227,12 @@ async function runTest1() {
   const { store, mockDb, mockAdmin } = makeStore();
   const pl = freshPL(store, mockDb, mockAdmin);
   const mobile = '7010000001';
-  seedDwCustomer(store, mobile, '60100001');
+  const dwId   = '60100001';
+  seedDwCustomer(store, mobile, dwId);
 
-  await pl.updateProductLedger(mobile, NONMATCH_ITEMS);
+  await pl.updateProductLedger(mobile, dwId, NONMATCH_ITEMS);
 
-  const doc = store.get(`customers/${mobile}/period_targets/${PERIOD_KEY}`);
+  const doc  = store.get(targetPath(mobile, dwId))?.target;
   const qty  = doc?.recommended_product?.quantity_purchased;
   const flag = doc?.product_completed;
 
@@ -229,11 +252,12 @@ async function runTest2() {
   const { store, mockDb, mockAdmin } = makeStore();
   const pl = freshPL(store, mockDb, mockAdmin);
   const mobile = '7010000002';
-  seedDwCustomer(store, mobile, '60100002');
+  const dwId   = '60100002';
+  seedDwCustomer(store, mobile, dwId);
 
-  await pl.updateProductLedger(mobile, MATCHING_ITEMS);  // +3
+  await pl.updateProductLedger(mobile, dwId, MATCHING_ITEMS);  // +3
 
-  const doc = store.get(`customers/${mobile}/period_targets/${PERIOD_KEY}`);
+  const doc  = store.get(targetPath(mobile, dwId))?.target;
   const qty  = doc?.recommended_product?.quantity_purchased;
   const flag = doc?.product_completed;
 
@@ -253,7 +277,8 @@ async function runTest3() {
   const { store, mockDb, mockAdmin } = makeStore();
   const pl = freshPL(store, mockDb, mockAdmin);
   const mobile = '7010000003';
-  seedDwCustomer(store, mobile, '60100003', {
+  const dwId   = '60100003';
+  seedDwCustomer(store, mobile, dwId, {
     recommended_product: {
       product_name:       'Nitri Charged Man',
       quantity_required:  20,
@@ -261,9 +286,9 @@ async function runTest3() {
     },
   });
 
-  await pl.updateProductLedger(mobile, [{ 'Item Name': 'Nitri Charged Man', 'Qty': '5' }]);
+  await pl.updateProductLedger(mobile, dwId, [{ 'Item Name': 'Nitri Charged Man', 'Qty': '5' }]);
 
-  const doc = store.get(`customers/${mobile}/period_targets/${PERIOD_KEY}`);
+  const doc  = store.get(targetPath(mobile, dwId))?.target;
   const qty  = doc?.recommended_product?.quantity_purchased;
   const flag = doc?.product_completed;
 
@@ -283,7 +308,8 @@ async function runTest4() {
   const { store, mockDb, mockAdmin } = makeStore();
   const pl = freshPL(store, mockDb, mockAdmin);
   const mobile = '7010000004';
-  seedDwCustomer(store, mobile, '60100004', {
+  const dwId   = '60100004';
+  seedDwCustomer(store, mobile, dwId, {
     product_completed: true,
     recommended_product: {
       product_name:       'Nitri Charged Man',
@@ -292,9 +318,9 @@ async function runTest4() {
     },
   });
 
-  await pl.updateProductLedger(mobile, [{ 'Item Name': 'Nitri Charged Man', 'Qty': '5' }]);
+  await pl.updateProductLedger(mobile, dwId, [{ 'Item Name': 'Nitri Charged Man', 'Qty': '5' }]);
 
-  const doc = store.get(`customers/${mobile}/period_targets/${PERIOD_KEY}`);
+  const doc  = store.get(targetPath(mobile, dwId))?.target;
   const qty  = doc?.recommended_product?.quantity_purchased;
   const flag = doc?.product_completed;
 
@@ -314,11 +340,12 @@ async function runTest5() {
   const { store, mockDb, mockAdmin } = makeStore();
   const pl = freshPL(store, mockDb, mockAdmin);
   const mobile = '7010000005';
-  seedAbCustomer(store, mobile, '12345678');  // AB ID — not DW
+  const abId   = '12345678';
+  seedAbCustomer(store, mobile, abId);  // AB ID — not DW
 
-  await pl.updateProductLedger(mobile, MATCHING_ITEMS);
+  await pl.updateProductLedger(mobile, abId, MATCHING_ITEMS);
 
-  const doc = store.get(`customers/${mobile}/period_targets/${PERIOD_KEY}`);
+  const doc  = store.get(targetPath(mobile, abId))?.target;
   const qty  = doc?.recommended_product?.quantity_purchased;
 
   return {
@@ -343,6 +370,8 @@ async function runTest6() {
   delete require.cache[require.resolve('./ledger-writer')];
   delete require.cache[require.resolve('./base-reward-calculator')];
   delete require.cache[require.resolve('./data-ingestion')];
+  delete require.cache[require.resolve('./reward-calculator')];
+  delete require.cache[require.resolve('./customer-schema')];
   const pl = require('./product-ledger');
   pl._setNow(() => new Date('2026-06-29'));
 
@@ -353,21 +382,23 @@ async function runTest6() {
 
   // Seed customer (linked ID makes it resolvable)
   store.set(`customers/${mobile}`, {
-    profile: { linked_ids: [dwId], name: 'DW Dup Test', tier: 'Saathi' },
+    profile: { linked_ids: [{ id: dwId, type: 'display_wall' }], linked_id_values: [dwId], name: 'DW Dup Test', tier: 'Saathi' },
   });
-  store.set(`customers/${mobile}/period_targets/${PERIOD_KEY}`, {
-    period_key:        PERIOD_KEY,
-    growth_threshold:  100000,
-    product_completed: false,
-    recommended_product: {
-      product_name:       'Nitri Charged Man',
-      quantity_required:  20,
-      quantity_purchased: 5,
+  store.set(targetPath(mobile, dwId), {
+    target: {
+      period_key:        PERIOD_KEY,
+      growth_threshold:  100000,
+      product_completed: false,
+      recommended_product: {
+        product_name:       'Nitri Charged Man',
+        quantity_required:  20,
+        quantity_purchased: 5,
+      },
     },
   });
 
   // party code → mobile via array-contains lookup is handled by resolveMobile
-  // which queries customers where profile.linked_ids array-contains the party code.
+  // which queries customers where profile.linked_id_values array-contains the party code.
   // The store uses the mockDb.collection.where path which is already set up above.
 
   const tx = {
@@ -382,12 +413,12 @@ async function runTest6() {
 
   // First ingest
   await ingestTransactions([tx]);
-  const afterFirst = store.get(`customers/${mobile}/period_targets/${PERIOD_KEY}`);
+  const afterFirst = store.get(targetPath(mobile, dwId))?.target;
   const qtyAfterFirst = afterFirst?.recommended_product?.quantity_purchased;
 
   // Second ingest of same bill
   await ingestTransactions([tx]);
-  const afterSecond = store.get(`customers/${mobile}/period_targets/${PERIOD_KEY}`);
+  const afterSecond = store.get(targetPath(mobile, dwId))?.target;
   const qtyAfterSecond = afterSecond?.recommended_product?.quantity_purchased;
 
   return {

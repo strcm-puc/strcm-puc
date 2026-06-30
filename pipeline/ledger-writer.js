@@ -1,15 +1,21 @@
 const { db, admin } = require('../firebase-config');
+const { idRef, ledgerEntriesCol, idType, fiscalPeriodKey } = require('./customer-schema');
 
-async function applyCredit(mobile, id_used, amount, reason, bill_number) {
-  const debtRef    = db.collection('customers').doc(mobile).collection('debts').doc(id_used);
-  const ledgerRef  = db.collection('customers').doc(mobile).collection('st_rupees_ledger').doc(id_used);
-  const entriesRef = ledgerRef.collection('entries');
+// current_balance/debt live on the id-level doc (customers/{mobile}/ids/{id}) —
+// running totals that span every period, never reset. The entries log itself is
+// period-scoped, filed under whichever period `date` falls into; date defaults to
+// "now" for callers that don't have a specific transaction date.
+async function applyCredit(mobile, id_used, amount, reason, bill_number, date = new Date()) {
+  const idDoc      = idRef(mobile, id_used);
+  const periodKey  = fiscalPeriodKey(date, idType(id_used) === 'display_wall');
+  const entriesRef = ledgerEntriesCol(mobile, id_used, periodKey);
 
   return db.runTransaction(async (txn) => {
-    const [debtSnap, ledgerSnap] = await Promise.all([txn.get(debtRef), txn.get(ledgerRef)]);
+    const idSnap = await txn.get(idDoc);
+    const data   = idSnap.exists ? idSnap.data() : {};
 
-    const debt           = debtSnap.exists   ? (debtSnap.data().amount          ?? 0) : 0;
-    const currentBalance = ledgerSnap.exists ? (ledgerSnap.data().current_balance ?? 0) : 0;
+    const debt           = data.debt            ?? 0;
+    const currentBalance = data.current_balance ?? 0;
 
     const now = admin.firestore.FieldValue.serverTimestamp();
     let remaining = amount;
@@ -45,8 +51,7 @@ async function applyCredit(mobile, id_used, amount, reason, bill_number) {
     // Safety guard — balance must never go negative
     if (newBalance < 0) newBalance = 0;
 
-    txn.set(debtRef,   { amount: newDebt });
-    txn.set(ledgerRef, { current_balance: newBalance }, { merge: true });
+    txn.set(idDoc, { current_balance: newBalance, debt: newDebt }, { merge: true });
 
     return {
       newBalance,
@@ -58,16 +63,17 @@ async function applyCredit(mobile, id_used, amount, reason, bill_number) {
   });
 }
 
-async function applyDebit(mobile, id_used, amount, reason, bill_number) {
-  const debtRef    = db.collection('customers').doc(mobile).collection('debts').doc(id_used);
-  const ledgerRef  = db.collection('customers').doc(mobile).collection('st_rupees_ledger').doc(id_used);
-  const entriesRef = ledgerRef.collection('entries');
+async function applyDebit(mobile, id_used, amount, reason, bill_number, date = new Date()) {
+  const idDoc      = idRef(mobile, id_used);
+  const periodKey  = fiscalPeriodKey(date, idType(id_used) === 'display_wall');
+  const entriesRef = ledgerEntriesCol(mobile, id_used, periodKey);
 
   return db.runTransaction(async (txn) => {
-    const [debtSnap, ledgerSnap] = await Promise.all([txn.get(debtRef), txn.get(ledgerRef)]);
+    const idSnap = await txn.get(idDoc);
+    const data   = idSnap.exists ? idSnap.data() : {};
 
-    const currentDebt    = debtSnap.exists   ? (debtSnap.data().amount          ?? 0) : 0;
-    const currentBalance = ledgerSnap.exists ? (ledgerSnap.data().current_balance ?? 0) : 0;
+    const currentDebt    = data.debt            ?? 0;
+    const currentBalance = data.current_balance ?? 0;
 
     const now = admin.firestore.FieldValue.serverTimestamp();
 
@@ -93,11 +99,8 @@ async function applyDebit(mobile, id_used, amount, reason, bill_number) {
       });
     }
 
-    txn.set(ledgerRef, { current_balance: newBalance }, { merge: true });
-
-    if (additionalDebt > 0) {
-      txn.set(debtRef, { amount: currentDebt + additionalDebt });
-    }
+    const newDebt = currentDebt + additionalDebt;
+    txn.set(idDoc, { current_balance: newBalance, debt: newDebt }, { merge: true });
 
     return {
       newBalance,

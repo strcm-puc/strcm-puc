@@ -62,13 +62,19 @@ function makeCollectionRef(colPath) {
       }),
     }),
     get: async () => {
+      // Real Firestore allows "phantom" parent docs — addressable purely by having
+      // a subcollection beneath them. Dedupe on the immediate child segment so
+      // deeply-nested-only docs (e.g. ids/{id}/periods/{key}/purchases/*) show up.
       const prefix = colPath + '/';
-      const docs = [];
-      for (const [k, v] of store) {
+      const seen   = new Map();
+      for (const k of store.keys()) {
         if (!k.startsWith(prefix)) continue;
-        if (k.slice(prefix.length).includes('/')) continue;
-        docs.push({ id: k.split('/').pop(), data: () => v });
+        const id = k.slice(prefix.length).split('/')[0];
+        if (!seen.has(id)) seen.set(id, `${prefix}${id}`);
       }
+      const docs = [...seen.entries()].map(([id, docPath]) => ({
+        id, data: () => store.get(docPath) ?? {}, ref: makeDocRef(docPath),
+      }));
       return { docs };
     },
   };
@@ -125,7 +131,10 @@ function injectMock(relFromRoot, exports) {
 
 injectMock('firebase-config.js', { db: mockDb, admin: mockAdmin });
 injectMock('vault-read.js', {
-  getCredential: async () => ({ bot_token: 'test_token', admin_chat_id: '123456' }),
+  getCredential: async (category) => {
+    if (category === 'rcm_login') return { store_code: 'STORE_CODE_TEST' };
+    return { bot_token: 'test_token', admin_chat_id: '123456' };
+  },
 });
 
 // ── Load the module under test (all deps now see the mock) ────────────────────
@@ -133,21 +142,38 @@ const { ingestTransactions } = require('./data-ingestion');
 
 // ════════════════════════════════════════════════════════════════════════════════
 // Customer fixture data — pre-populated in the store before the test runs.
+// linked_ids is tagged [{id, type}]; linked_id_values is the parallel plain-string
+// array resolveMobile()'s array-contains query reads (see customer-schema.js).
 // ════════════════════════════════════════════════════════════════════════════════
 
 // Case 1: AB ID — will be under tier threshold (1 000 < 5 000)
 store.set('customers/9999000001', {
-  profile: { linked_ids: ['AB001'], tier_threshold: 5000, consecutive_months: 0 },
+  profile: {
+    linked_ids:       [{ id: 'AB001', type: 'ab_id' }],
+    linked_id_values: ['AB001'],
+    tier_threshold:   5000,
+    consecutive_months: 0,
+  },
 });
 
 // Case 2: AB ID — crosses tier threshold (6 000 > 5 000) and has loyalty streak (6 mo)
 store.set('customers/9999000002', {
-  profile: { linked_ids: ['AB002'], tier_threshold: 5000, consecutive_months: 6 },
+  profile: {
+    linked_ids:       [{ id: 'AB002', type: 'ab_id' }],
+    linked_id_values: ['AB002'],
+    tier_threshold:   5000,
+    consecutive_months: 6,
+  },
 });
 
 // Case 3: Display Wall ID (starts with '60') — Layer 2/3 must be skipped
 store.set('customers/9999000003', {
-  profile: { linked_ids: ['6012345'], tier_threshold: 5000, consecutive_months: 4 },
+  profile: {
+    linked_ids:       [{ id: '6012345', type: 'display_wall' }],
+    linked_id_values: ['6012345'],
+    tier_threshold:   5000,
+    consecutive_months: 4,
+  },
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -202,15 +228,19 @@ const transactions = [
 // ════════════════════════════════════════════════════════════════════════════════
 
 function getLedgerBalance(mobile, id_used) {
-  const d = store.get(`customers/${mobile}/st_rupees_ledger/${id_used}`);
+  const d = store.get(`customers/${mobile}/ids/${id_used}`);
   return d?.current_balance ?? 0;
 }
 
-function getPurchaseSummaryCount(mobile) {
-  const prefix = `customers/${mobile}/purchase_summary/`;
+// Counts purchase docs across all of this id's period folders:
+// customers/{mobile}/ids/{id}/periods/{periodKey}/purchases/{billNo}
+function getPurchaseCount(mobile, id_used) {
+  const prefix = `customers/${mobile}/ids/${id_used}/periods/`;
   let n = 0;
   for (const k of store.keys()) {
-    if (k.startsWith(prefix) && !k.slice(prefix.length).includes('/')) n++;
+    if (!k.startsWith(prefix)) continue;
+    const rest = k.slice(prefix.length); // {periodKey}/purchases/{billNo}
+    if (/^[^/]+\/purchases\/[^/]+$/.test(rest)) n++;
   }
   return n;
 }
@@ -245,9 +275,9 @@ async function runTest() {
   const b3 = getLedgerBalance('9999000003', '6012345');
   const b1dup = getLedgerBalance('9999000001', 'AB001'); // same as b1 — dup must not add
 
-  const ps1 = getPurchaseSummaryCount('9999000001');
-  const ps2 = getPurchaseSummaryCount('9999000002');
-  const ps3 = getPurchaseSummaryCount('9999000003');
+  const ps1 = getPurchaseCount('9999000001', 'AB001');
+  const ps2 = getPurchaseCount('9999000002', 'AB002');
+  const ps3 = getPurchaseCount('9999000003', '6012345');
 
   const b001processed = store.has('processed_bills/B001');
   const b002processed = store.has('processed_bills/B002');

@@ -64,13 +64,18 @@ function makeCollectionRef(colPath) {
       }),
     }),
     get: async () => {
+      // Real Firestore allows "phantom" parent docs — addressable purely by having
+      // a subcollection beneath them. Dedupe on the immediate child segment.
       const prefix = colPath + '/';
-      const docs = [];
-      for (const [k, v] of store) {
+      const seen   = new Map();
+      for (const k of store.keys()) {
         if (!k.startsWith(prefix)) continue;
-        if (k.slice(prefix.length).includes('/')) continue;
-        docs.push({ id: k.split('/').pop(), data: () => v });
+        const id = k.slice(prefix.length).split('/')[0];
+        if (!seen.has(id)) seen.set(id, `${prefix}${id}`);
       }
+      const docs = [...seen.entries()].map(([id, docPath]) => ({
+        id, data: () => store.get(docPath) ?? {}, ref: makeDocRef(docPath),
+      }));
       return { docs };
     },
   };
@@ -155,7 +160,12 @@ injectMock(pathMod.join(__dirname, 'scraper.js'), {
 
 // ── Seed the store with the customer the stub transaction references ───────────
 store.set('customers/9999000001', {
-  profile: { linked_ids: ['AB001'], tier_threshold: 5000, consecutive_months: 0 },
+  profile: {
+    linked_ids:       [{ id: 'AB001', type: 'ab_id' }],
+    linked_id_values: ['AB001'],
+    tier_threshold:   5000,
+    consecutive_months: 0,
+  },
 });
 
 // ── Load run-nightly.js (all deps now see mocks) ──────────────────────────────
@@ -164,17 +174,17 @@ const { runNightly } = require('./run-nightly');
 // ── Execute ───────────────────────────────────────────────────────────────────
 runNightly()
   .then(() => {
-    // Confirm the purchase_summary entry landed in the store
-    const prefix = 'customers/9999000001/purchase_summary/';
-    const entries = [...store.keys()].filter(k => k.startsWith(prefix));
-    console.log(`\n[test-runner] purchase_summary entries written: ${entries.length}`);
+    // Confirm the purchases entry landed in the store (customers/{m}/ids/{id}/periods/{key}/purchases/*)
+    const prefix = 'customers/9999000001/ids/AB001/periods/';
+    const entries = [...store.keys()].filter(k => prefix && k.startsWith(prefix) && /\/purchases\/[^/]+$/.test(k));
+    console.log(`\n[test-runner] purchase entries written: ${entries.length}`);
     entries.forEach(k => {
       const d = store.get(k);
       console.log(`[test-runner]   → bill_no: ${d.bill_no}, amount: ${d.amount}, id_used: ${d.id_used}`);
     });
 
-    const ledger = store.get('customers/9999000001/st_rupees_ledger/AB001');
-    console.log(`[test-runner] Ledger balance (AB001): ${ledger?.current_balance ?? 0}`);
+    const idDoc = store.get('customers/9999000001/ids/AB001');
+    console.log(`[test-runner] Ledger balance (AB001): ${idDoc?.current_balance ?? 0}`);
     console.log('[test-runner] run-nightly.js completed without errors ✓');
   })
   .catch(err => {

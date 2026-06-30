@@ -1,11 +1,19 @@
 'use strict';
 
 const https = require('https');
+const path = require('path');
+const { GoogleGenAI } = require('@google/genai');
 const { db, admin } = require('../firebase-config');
 const { getCredential } = require('../vault-read');
+const { idRef, tagLinkedIds, linkedIdValues } = require('./customer-schema');
+
+const GEMINI_MODEL = 'gemini-2.5-flash-lite';
+
+process.env.GOOGLE_APPLICATION_CREDENTIALS ??=
+  path.join(__dirname, '..', 'secrets', 'firebase-service-account.json');
 
 let _tgCreds;
-let _geminiKey;
+let _ai;
 let _lastUpdateId = 0;
 
 // ── Credential caches ──────────────────────────────────────────────────────────
@@ -17,49 +25,30 @@ async function _getTgCreds() {
   return _tgCreds;
 }
 
-async function _getGeminiKey() {
-  if (_geminiKey !== undefined) return _geminiKey;
-  try {
-    const c = await getCredential('gemini_api');
-    _geminiKey = String(c.api_key).trim();
-  } catch (e) {
-    console.warn('[listener] Gemini creds unavailable:', e.message);
-    _geminiKey = null;
+function _getAi() {
+  if (!_ai) {
+    _ai = new GoogleGenAI({
+      vertexai: true,
+      project:  'strcm-apex-500420',
+      location: 'us-central1',
+    });
   }
-  return _geminiKey;
+  return _ai;
 }
 
 // ── Gemini API ─────────────────────────────────────────────────────────────────
 
 async function _callGemini(prompt) {
-  const key = await _getGeminiKey();
-  if (!key) throw new Error('Gemini credentials not available');
-  const body = JSON.stringify({
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: { responseMimeType: 'application/json' },
+  const response = await _getAi().models.generateContent({
+    model:    GEMINI_MODEL,
+    contents: prompt,
+    config:   { responseMimeType: 'application/json' },
   });
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'generativelanguage.googleapis.com',
-      path:     `/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
-      method:   'POST',
-      headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, (res) => {
-      let raw = '';
-      res.on('data', c => raw += c);
-      res.on('end',  () => {
-        try {
-          const parsed = JSON.parse(raw);
-          if (parsed.error) return reject(new Error(parsed.error.message ?? 'Gemini API error'));
-          const text  = parsed.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}';
-          const match = text.match(/\{[\s\S]*\}/);
-          resolve(JSON.parse(match?.[0] ?? '{}'));
-        } catch (e) { reject(new Error(`Gemini parse failed: ${e.message}`)); }
-      });
-    });
-    req.on('error', reject);
-    req.write(body); req.end();
-  });
+  const text  = response.text ?? '{}';
+  const match = text.match(/\{[\s\S]*\}/);
+  try {
+    return JSON.parse(match?.[0] ?? '{}');
+  } catch (e) { throw new Error(`Gemini parse failed: ${e.message}`); }
 }
 
 // ── Telegram API ───────────────────────────────────────────────────────────────
@@ -156,13 +145,17 @@ async function _createProfile(mobile, partyCode, partyName) {
   }
 
   const now = admin.firestore.FieldValue.serverTimestamp();
+  const taggedIds = tagLinkedIds([partyCode]);
   const profile = {
-    name:               nameFinal,
+    name:                nameFinal,
     gender,
-    linked_ids:         [partyCode],
-    tier:               'Bronze',
-    language:           'hi',
-    is_active:          true,
+    linked_ids:          taggedIds,
+    linked_id_values:    linkedIdValues(taggedIds),
+    tier:                'Bronze',
+    language:            'hi',
+    status:              'active',
+    last_purchase_date:   null,
+    last_purchase_amount: null,
     join_date:          now,
     consecutive_months: 0,
     tier_threshold:     null,
@@ -175,21 +168,17 @@ async function _createProfile(mobile, partyCode, partyName) {
   // Main profile doc
   await custRef.set({ profile }, { merge: true });
 
-  // D9 sub-collections — created at onboarding so the rest of the pipeline
-  // can safely read/update them without existence checks.
+  // id-level doc (running balance/debt — never period-scoped) + behavior_advice,
+  // created at onboarding so the rest of the pipeline can safely read/update
+  // them without existence checks.
   await Promise.all([
-    custRef.collection('st_rupees_ledger').doc(partyCode).set({
-      current_balance:   0,
-      lifetime_earned:   0,
-      lifetime_redeemed: 0,
+    idRef(mobile, partyCode).set({
+      current_balance: 0,
+      debt:             0,
     }),
     custRef.collection('behavior_advice').doc(partyCode).set({
       party_code:  partyCode,
       created_at:  now,
-    }),
-    custRef.collection('targets').doc('current').set({
-      current: null,
-      history: [],
     }),
   ]);
 
@@ -198,11 +187,49 @@ async function _createProfile(mobile, partyCode, partyName) {
   return { ...profile, _fsPath: fsPath };
 }
 
+// ── /cost command — owner-only system spend report ────────────────────────────
+// No spend tracking is instrumented anywhere in the codebase today (confirmed by
+// reading every Sonnet/Gemini/WhatsApp/Firebase call site — none of them log token
+// counts, request counts, or cost to anywhere). This reports that honestly instead
+// of fabricating numbers, and states exactly what would need to be added.
+async function _handleCostCommand(chatId) {
+  const tg = await _getTgCreds();
+  if (!tg || chatId !== String(tg.admin_chat_id).trim()) return; // owner-only, silent for anyone else
+
+  await _sendTelegramMessage(chatId,
+    `💰 <b>ST-APEX Cost Report</b>\n\n` +
+    `No spend tracking exists in the system yet — today's spend, this month's spend, and a ` +
+    `per-category breakdown are all <b>not available</b>. I'm not going to invent numbers.\n\n` +
+    `<b>To make this real, the following needs to be instrumented:</b>\n` +
+    `• <b>Sonnet</b> — log <code>usage.input_tokens</code> / <code>usage.output_tokens</code> from ` +
+    `every Anthropic response in reward-calculator.js's _callClaude, priced at the Claude Sonnet rate.\n` +
+    `• <b>Gemini</b> — log <code>response.usageMetadata</code> token counts from every Vertex AI call ` +
+    `in message-writer.js / telegram-listener.js's _callGemini, priced at the Gemini Flash-Lite rate.\n` +
+    `• <b>WhatsApp</b> — log Meta's per-conversation pricing category from each send in sender.js ` +
+    `(Meta bills per conversation window, not per message).\n` +
+    `• <b>Firebase</b> — pulled from the GCP Billing API for Firestore reads/writes/storage, not ` +
+    `something this app computes itself.\n` +
+    `• <b>Server</b> — the strcm-apex-vm cost, also from GCP Billing, not app code.\n\n` +
+    `Once each call site writes a cost-log entry, this command can sum today's and this month's ` +
+    `entries by category. Right now there is nothing to sum.`
+  );
+  console.log('[listener] /cost answered — no spend tracking instrumented yet');
+}
+
 // ── Process a single Telegram update ──────────────────────────────────────────
 
 async function _processUpdate(update) {
   const msg = update.message ?? update.edited_message;
   if (!msg?.text) return;
+
+  const chatId    = String(msg.chat.id);
+  const replyText = (msg.text ?? '').trim();
+
+  // ── /cost: owner-only spend report — standalone command, not a reply ──────
+  if (replyText.toLowerCase() === '/cost') {
+    await _handleCostCommand(chatId);
+    return;
+  }
 
   // Only act on replies to bot alert messages
   const replyTo = msg.reply_to_message;
@@ -213,9 +240,6 @@ async function _processUpdate(update) {
     console.warn('[listener] Reply received but no party code in original message:', (replyTo.text ?? '').slice(0, 80));
     return;
   }
-
-  const chatId    = String(msg.chat.id);
-  const replyText = (msg.text ?? '').trim();
 
   // ── skip command ───────────────────────────────────────────────────────────
   if (replyText.toLowerCase() === 'skip' || replyText.toLowerCase() === 's') {
@@ -339,4 +363,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { startListener, _extractPartyCodeFromAlert, _parseMobile, _parseCompoundReply, _createProfile, _processUpdate };
+module.exports = { startListener, _extractPartyCodeFromAlert, _parseMobile, _parseCompoundReply, _createProfile, _processUpdate, _handleCostCommand };

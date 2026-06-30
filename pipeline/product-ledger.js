@@ -1,6 +1,6 @@
 'use strict';
 
-const { db } = require('../firebase-config');
+const { idType, fiscalPeriodKey, periodRef } = require('./customer-schema');
 
 let _nowFn = () => new Date();
 function _setNow(fn) { _nowFn = fn; }
@@ -20,13 +20,6 @@ function _pickNum(row, ...candidates) {
   return parseFloat(v) || 0;
 }
 
-// Current Display Wall period key (quarterly).
-function _dwPeriodKey(now) {
-  const y = now.getFullYear();
-  const q = Math.floor(now.getMonth() / 3) + 1;
-  return `${y}-Q${q}`;
-}
-
 // Case-insensitive, trimmed bidirectional substring match.
 // Strategy flagged: RCM POS item names in the export may be abbreviated or
 // cased differently from the recommended_product.product_name value that Adnan
@@ -40,30 +33,23 @@ function _namesMatch(rowName, productName) {
   return a === b || a.includes(b) || b.includes(a);
 }
 
-// Called once per ingested transaction batch per customer, immediately after
-// the Layer 1 base reward. No-ops for non-DW customers, missing targets, and
+// Called once per ingested transaction batch per (mobile, id_used), immediately
+// after the Layer 1 base reward. No-ops for non-DW ids, missing targets, and
 // missing recommended_product. Idempotency against duplicate bills is handled
 // upstream by the processed_bills guard in data-ingestion.js; this function
 // is not called a second time for the same bill.
-async function updateProductLedger(customerId, itemRows) {
+async function updateProductLedger(mobile, id_used, itemRows) {
   if (!Array.isArray(itemRows) || itemRows.length === 0) return;
+  if (idType(id_used) !== 'display_wall') return;
 
-  const custSnap = await db.collection('customers').doc(customerId).get();
-  if (!custSnap.exists) return;
+  const periodKey  = fiscalPeriodKey(_nowFn(), true);
+  const periodDoc  = periodRef(mobile, id_used, periodKey);
+  const periodSnap = await periodDoc.get();
+  if (!periodSnap.exists) return;
 
-  const profile   = custSnap.data().profile ?? {};
-  const linkedIds = profile.linked_ids ?? [];
-  const isDW      = linkedIds.length > 0 && linkedIds.every(id => String(id).startsWith('60'));
-  if (!isDW) return;
-
-  const periodKey = _dwPeriodKey(_nowFn());
-  const targetRef = db.collection('customers').doc(customerId)
-    .collection('period_targets').doc(periodKey);
-  const targetSnap = await targetRef.get();
-  if (!targetSnap.exists) return;
-
-  const targetData = targetSnap.data();
-  const recProd    = targetData.recommended_product;
+  const periodData = periodSnap.data();
+  const target      = periodData.target ?? {};
+  const recProd     = target.recommended_product;
   if (!recProd || !recProd.product_name) return;
 
   const productName      = String(recProd.product_name);
@@ -83,23 +69,23 @@ async function updateProductLedger(customerId, itemRows) {
   }
   if (matchedQty <= 0) return;
 
-  const alreadyCompleted = targetData.product_completed === true;
+  const alreadyCompleted = target.product_completed === true;
   const currentPurchased = Number(recProd.quantity_purchased ?? 0);
   const newPurchased     = currentPurchased + matchedQty;
 
-  // Single targeted field update — never overwrites other period_targets fields.
-  const updateObj = { 'recommended_product.quantity_purchased': newPurchased };
+  // Single targeted field update — never overwrites other target fields.
+  const updateObj = { 'target.recommended_product.quantity_purchased': newPurchased };
   if (!alreadyCompleted && newPurchased >= quantityRequired) {
-    updateObj.product_completed = true;
+    updateObj['target.product_completed'] = true;
   }
 
-  await targetRef.update(updateObj);
+  await periodDoc.update(updateObj);
 
   console.log(
-    `[product-ledger] ${customerId} | ${periodKey} | ` +
+    `[product-ledger] ${mobile} | ${id_used} | ${periodKey} | ` +
     `${productName}: +${matchedQty} → ${newPurchased}/${quantityRequired}` +
-    (updateObj.product_completed ? ' → COMPLETED ✓' : '')
+    (updateObj['target.product_completed'] ? ' → COMPLETED ✓' : '')
   );
 }
 
-module.exports = { updateProductLedger, _setNow };
+module.exports = { updateProductLedger, _pickStr, _pickNum, _setNow };

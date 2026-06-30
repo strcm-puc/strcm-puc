@@ -65,7 +65,7 @@ async function sendTelegramAlert(botToken, chatId, text) {
 
 async function isKnownPartyCode(partyCode) {
   const snap = await db.collection('customers')
-    .where('profile.linked_ids', 'array-contains', partyCode)
+    .where('profile.linked_id_values', 'array-contains', partyCode)
     .limit(1)
     .get();
   return !snap.empty;

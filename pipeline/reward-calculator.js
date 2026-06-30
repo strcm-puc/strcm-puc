@@ -4,6 +4,10 @@ const https  = require('https');
 const { db, admin } = require('../firebase-config');
 const { getCredential }  = require('../vault-read');
 const { applyCredit }    = require('./ledger-writer');
+const {
+  customerRef, idRef, periodRef, purchasesCol, ledgerEntriesCol,
+  fiscalPeriodKey, isDisplayWallProfile,
+} = require('./customer-schema');
 
 // ── Test hook: inject a fixed "today" so unit tests control date-gating ───────
 let _nowFn = () => new Date();
@@ -99,6 +103,10 @@ async function _callClaude(userMessage) {
 }
 
 // ── Date / period helpers ─────────────────────────────────────────────────────
+// These compute calendar boundaries and in-memory grouping/sort keys — UNCHANGED
+// math from before. fiscalPeriodKey() (customer-schema.js) is used separately,
+// only to name the Firestore storage folder; it never affects which dates group
+// together or how periods compare/sort here.
 
 function parseDate(str) {
   if (!str) return null;
@@ -110,10 +118,16 @@ function parseDate(str) {
   return isNaN(d.getTime()) ? null : d;
 }
 
-// A customer is Display Wall when ALL their linked IDs start with '60'.
+// A customer is Display Wall when ALL their linked IDs are tagged display_wall.
 function isDisplayWallCustomer(profile) {
-  const ids = profile?.linked_ids ?? [];
-  return ids.length > 0 && ids.every(id => String(id).startsWith('60'));
+  return isDisplayWallProfile(profile);
+}
+
+// Plain ID strings from a tagged linked_ids array, filtered to the matching type.
+function _matchingIds(linkedIds, isDW) {
+  return (linkedIds ?? [])
+    .filter(li => li.type === (isDW ? 'display_wall' : 'ab_id'))
+    .map(li => li.id);
 }
 
 // Returns the first day and last day of the current period as midnight-local Date objects.
@@ -145,23 +159,14 @@ function daysUntilPeriodEnd(date, isDW) {
   return Math.round((e - d) / 86400000);
 }
 
-// Period key strings: '2026-06' (monthly) or '2026-Q2' (quarterly).
+// In-memory grouping/sort key: '2026-06' (monthly) or '2026-Q2' (quarterly).
+// Calendar-based so string comparison ('h.period < periodKey') sorts chronologically —
+// this is NOT the Firestore storage path key (see fiscalPeriodKey for that).
 function getPeriodKey(date, isDW) {
   const y = date.getFullYear();
   const m = date.getMonth();
   if (isDW) return `${y}-Q${Math.floor(m / 3) + 1}`;
   return `${y}-${String(m + 1).padStart(2, '0')}`;
-}
-
-function getPrevPeriodKey(date, isDW) {
-  if (isDW) {
-    const y = date.getFullYear();
-    const q = Math.floor(date.getMonth() / 3) + 1;
-    return q === 1 ? `${y - 1}-Q4` : `${y}-Q${q - 1}`;
-  }
-  const d = new Date(date.getFullYear(), date.getMonth(), 1);
-  d.setMonth(d.getMonth() - 1);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
 
 // Last calendar day of the previous period, as a Date.
@@ -189,20 +194,23 @@ function _getBudgetMax(profile, isDW) {
 
 // ── Firestore data helpers ────────────────────────────────────────────────────
 
-// Groups purchase_summary by period, returns last N periods sorted ascending.
-async function fetchPurchaseHistory(mobile, isDW, periodsBack = 6) {
-  const snap = await db.collection('customers').doc(mobile).collection('purchase_summary').get();
+// Groups purchases by calendar period across this customer's matching-type ids,
+// returns last N periods sorted ascending. Reads customers/{mobile}/ids/{id}/periods/*/purchases.
+async function fetchPurchaseHistory(mobile, linkedIds, isDW, periodsBack = 6) {
+  const ids = _matchingIds(linkedIds, isDW);
   const grouped = {};
-  for (const doc of snap.docs) {
-    const d   = doc.data();
-    const dt  = parseDate(d.date);
-    if (!dt) continue;
-    const y = dt.getFullYear();
-    const m = dt.getMonth();
-    const key = isDW
-      ? `${y}-Q${Math.floor(m / 3) + 1}`
-      : `${y}-${String(m + 1).padStart(2, '0')}`;
-    grouped[key] = (grouped[key] ?? 0) + (parseFloat(d.amount) || 0);
+  for (const id of ids) {
+    const periodsSnap = await idRef(mobile, id).collection('periods').get();
+    for (const periodDoc of periodsSnap.docs) {
+      const purchasesSnap = await periodDoc.ref.collection('purchases').get();
+      for (const p of purchasesSnap.docs) {
+        const d  = p.data();
+        const dt = parseDate(d.date);
+        if (!dt) continue;
+        const key = getPeriodKey(dt, isDW);
+        grouped[key] = (grouped[key] ?? 0) + (parseFloat(d.amount) || 0);
+      }
+    }
   }
   return Object.entries(grouped)
     .sort(([a], [b]) => (a < b ? -1 : 1))
@@ -210,33 +218,37 @@ async function fetchPurchaseHistory(mobile, isDW, periodsBack = 6) {
     .map(([period, total]) => ({ period, total }));
 }
 
-// Sums purchase_summary amounts within a date range (inclusive).
-// excludeIds: optional Set of id_used values whose amounts are excluded (ST Rupees store code).
-async function fetchPeriodSales(mobile, periodStart, periodEnd, excludeIds = null) {
-  const snap = await db.collection('customers').doc(mobile).collection('purchase_summary').get();
+// Sums purchases within a date range (inclusive) across matching-type ids.
+// excludeIds: optional Set of id values to skip entirely (ST Rupees store code).
+async function fetchPeriodSales(mobile, linkedIds, isDW, periodStart, periodEnd, excludeIds = null) {
+  const storageKey = fiscalPeriodKey(periodStart, isDW);
+  const ids = _matchingIds(linkedIds, isDW);
   const s = new Date(periodStart.getFullYear(), periodStart.getMonth(), periodStart.getDate());
   const e = new Date(periodEnd.getFullYear(),   periodEnd.getMonth(),   periodEnd.getDate());
   let total = 0;
-  for (const doc of snap.docs) {
-    const d  = doc.data();
-    if (excludeIds && excludeIds.has(String(d.id_used ?? ''))) continue;
-    const dt = parseDate(d.date);
-    if (!dt) continue;
-    const day = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
-    if (day >= s && day <= e) total += parseFloat(d.amount) || 0;
+  for (const id of ids) {
+    if (excludeIds && excludeIds.has(String(id))) continue;
+    const snap = await purchasesCol(mobile, id, storageKey).get();
+    for (const doc of snap.docs) {
+      const d  = doc.data();
+      const dt = parseDate(d.date);
+      if (!dt) continue;
+      const day = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+      if (day >= s && day <= e) total += parseFloat(d.amount) || 0;
+    }
   }
   return total;
 }
 
-// Sums 'goods return reversal' ledger entries within a date range across all linked IDs.
-async function fetchPeriodReturns(mobile, linkedIds, periodStart, periodEnd) {
+// Sums 'goods return reversal' ledger entries within a date range across matching-type ids.
+async function fetchPeriodReturns(mobile, linkedIds, isDW, periodStart, periodEnd) {
+  const storageKey = fiscalPeriodKey(periodStart, isDW);
+  const ids = _matchingIds(linkedIds, isDW);
   const s = new Date(periodStart.getFullYear(), periodStart.getMonth(), periodStart.getDate());
   const e = new Date(periodEnd.getFullYear(),   periodEnd.getMonth(),   periodEnd.getDate());
   let totalReturns = 0;
-  for (const idUsed of linkedIds) {
-    const snap = await db.collection('customers').doc(mobile)
-      .collection('st_rupees_ledger').doc(String(idUsed))
-      .collection('entries').get();
+  for (const id of ids) {
+    const snap = await ledgerEntriesCol(mobile, id, storageKey).get();
     for (const doc of snap.docs) {
       const d = doc.data();
       if (d.reason !== 'goods return reversal') continue;
@@ -249,48 +261,58 @@ async function fetchPeriodReturns(mobile, linkedIds, periodStart, periodEnd) {
   return totalReturns;
 }
 
+// The id this customer's period/target/bonus/message-budget data is filed under —
+// same "first linked id" convention as before, just now reading the tagged shape.
+function _primaryId(profile, customerId) {
+  return (profile.linked_ids ?? [])[0]?.id ?? customerId;
+}
+
 // ── Function 1: setPeriodTarget ───────────────────────────────────────────────
 // Runs on days 1–5 of a new period. Computes the bracket reference for this period
 // using a rolling 3-period average (AB ID) or quarter-based stretch (DW — next step).
 async function setPeriodTarget(customerId, salesDate) {
   const today = salesDate ?? _nowFn();
 
-  const snap = await db.collection('customers').doc(customerId).get();
+  const snap = await customerRef(customerId).get();
   if (!snap.exists) return { skipped: true, reason: 'customer not found' };
 
   const profile = snap.data().profile ?? {};
   const isDW    = isDisplayWallCustomer(profile);
+  const primaryId = _primaryId(profile, customerId);
 
   const dayOfPeriod = getDayOfPeriod(today, isDW);
   if (dayOfPeriod > 5) return { skipped: true, reason: `day ${dayOfPeriod} outside window [1-5]` };
 
-  const periodKey = getPeriodKey(today, isDW);
+  const periodKey  = getPeriodKey(today, isDW);          // in-memory/log label
+  const storageKey = fiscalPeriodKey(today, isDW);        // Firestore folder name
   const { start: periodStart, end: periodEnd } = getPeriodBounds(today, isDW);
 
   // Idempotent: target already set for this period → skip
-  const existingSnap = await db.collection('customers').doc(customerId)
-    .collection('period_targets').doc(periodKey).get();
-  if (existingSnap.exists) return { skipped: true, reason: 'target already set', periodKey };
+  const periodDocRef  = periodRef(customerId, primaryId, storageKey);
+  const existingSnap  = await periodDocRef.get();
+  if (existingSnap.exists && existingSnap.data()?.target) {
+    return { skipped: true, reason: 'target already set', periodKey };
+  }
 
   // Previous-period wrap-up: pay missed bonus before opening new period
-  const prevKey        = getPrevPeriodKey(today, isDW);
-  const prevTargetSnap = await db.collection('customers').doc(customerId)
-    .collection('period_targets').doc(prevKey).get();
-  const prevBonusSnap  = await db.collection('customers').doc(customerId)
-    .collection('period_bonuses').doc(prevKey).get();
-  if (prevTargetSnap.exists && !prevBonusSnap.exists) {
-    console.log(`[reward] ${customerId} | wrap-up: paying missed bonus for ${prevKey}`);
-    await checkPeriodEndBonus(customerId, getPrevPeriodLastDay(today, isDW));
+  const prevLastDay   = getPrevPeriodLastDay(today, isDW);
+  const prevStorageKey = fiscalPeriodKey(prevLastDay, isDW);
+  const prevPeriodSnap = await periodRef(customerId, primaryId, prevStorageKey).get();
+  const prevHasTarget  = prevPeriodSnap.exists && !!prevPeriodSnap.data()?.target;
+  const prevLocked     = prevPeriodSnap.exists && prevPeriodSnap.data()?.locked === true;
+  if (prevHasTarget && !prevLocked) {
+    console.log(`[reward] ${customerId} | wrap-up: paying missed bonus for prior period`);
+    await checkPeriodEndBonus(customerId, prevLastDay);
   }
 
   // ── Display Wall target: 108% new-account onboarding or 110% regular ────────
   if (isDW) {
-    const dwHistory     = await fetchPurchaseHistory(customerId, isDW, 6);
+    const dwHistory     = await fetchPurchaseHistory(customerId, profile.linked_ids, isDW, 6);
     // Dormant freeze: zero-spend quarters are excluded from the average entirely
     const realQuarters  = dwHistory.filter(h => h.total > 0);
     const isNewAccount  = realQuarters.length < 3;
 
-    let dwTargetDoc;
+    let dwTarget;
 
     if (isNewAccount) {
       // New-account onboarding (< 3 full quarters of real history):
@@ -301,7 +323,7 @@ async function setPeriodTarget(customerId, salesDate) {
         : 0;
       const targetAmount = Math.round(baselineAvg * 1.08);
 
-      dwTargetDoc = {
+      dwTarget = {
         period_key:          periodKey,
         target_amount:       targetAmount,
         rolling_average:     Math.round(baselineAvg),
@@ -313,7 +335,6 @@ async function setPeriodTarget(customerId, salesDate) {
         period_start:        periodStart.toISOString().slice(0, 10),
         period_end:          periodEnd.toISOString().slice(0, 10),
         reasoning:           `DW new-account onboarding: ${realQuarters.length} quarter(s) on record; 108% of baseline Rs ${Math.round(baselineAvg)} = Rs ${targetAmount}`,
-        set_at:              admin.firestore.FieldValue.serverTimestamp(),
       };
     } else {
       // Full system: last 3 real quarters, 70% anti-sandbagging floor (DW floor ≠ AB 80%)
@@ -324,7 +345,7 @@ async function setPeriodTarget(customerId, salesDate) {
       const rollingAvg = Math.round(floored3.reduce((a, b) => a + b, 0) / 3);
       const growthThreshold = Math.round(rollingAvg * 1.10);
 
-      dwTargetDoc = {
+      dwTarget = {
         period_key:          periodKey,
         target_amount:       growthThreshold,
         rolling_average:     rollingAvg,
@@ -335,24 +356,24 @@ async function setPeriodTarget(customerId, salesDate) {
         period_start:        periodStart.toISOString().slice(0, 10),
         period_end:          periodEnd.toISOString().slice(0, 10),
         reasoning:           `DW rolling avg Rs ${rollingAvg} (3-quarter, 70% sandbag-floor); target ≥ Rs ${growthThreshold} (110%)`,
-        set_at:              admin.firestore.FieldValue.serverTimestamp(),
       };
     }
 
-    await db.collection('customers').doc(customerId)
-      .collection('period_targets').doc(periodKey)
-      .set(dwTargetDoc);
+    await periodDocRef.set({
+      target: dwTarget,
+      set_at: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
 
     console.log(
       `[reward] setPeriodTarget ${customerId} | ${periodKey} | ` +
-      `DW ${isNewAccount ? 'new-account onboarding' : `avg=Rs ${dwTargetDoc.rolling_average}`} | ` +
-      dwTargetDoc.reasoning
+      `DW ${isNewAccount ? 'new-account onboarding' : `avg=Rs ${dwTarget.rolling_average}`} | ` +
+      dwTarget.reasoning
     );
-    return { periodKey, targetAmount: dwTargetDoc.target_amount, newAccount: isNewAccount, skipped: false };
+    return { periodKey, targetAmount: dwTarget.target_amount, newAccount: isNewAccount, skipped: false };
   }
 
   // ── AB ID: rolling-average bracket system ─────────────────────────────────────
-  const history     = await fetchPurchaseHistory(customerId, isDW, 6);
+  const history     = await fetchPurchaseHistory(customerId, profile.linked_ids, isDW, 6);
   // Periods with real purchases only (exclude phantom zero periods)
   const realPeriods = history.filter(h => h.total > 0);
 
@@ -367,7 +388,7 @@ async function setPeriodTarget(customerId, salesDate) {
   // Which cold-start month we're on: 1, 2, or 3
   const coldStartMonth = isColdStart ? Math.min(realPeriods.length + 1, 3) : null;
 
-  let targetDoc;
+  let target;
 
   if (isColdStart) {
     let targetAmount  = 0;
@@ -387,7 +408,7 @@ async function setPeriodTarget(customerId, salesDate) {
       coldReasoning = `Cold-start month 3: month-2 actual Rs ${m2Total} + Rs 200`;
     }
 
-    targetDoc = {
+    target = {
       period_key:       periodKey,
       target_amount:    targetAmount,
       rolling_average:  0,
@@ -398,7 +419,6 @@ async function setPeriodTarget(customerId, salesDate) {
       period_start:     periodStart.toISOString().slice(0, 10),
       period_end:       periodEnd.toISOString().slice(0, 10),
       reasoning:        coldReasoning,
-      set_at:           admin.firestore.FieldValue.serverTimestamp(),
     };
   } else {
     // Full rolling-average system: last 3 real periods, anti-sandbagging floor at 80%
@@ -413,7 +433,7 @@ async function setPeriodTarget(customerId, salesDate) {
     const missedThreshold = Math.round(rollingAvg * 0.90);
     const growthThreshold = Math.round(rollingAvg * 1.05);
 
-    targetDoc = {
+    target = {
       period_key:       periodKey,
       target_amount:    growthThreshold,   // Growth threshold shown as the stretch goal in messaging
       rolling_average:  rollingAvg,
@@ -424,20 +444,20 @@ async function setPeriodTarget(customerId, salesDate) {
       period_start:     periodStart.toISOString().slice(0, 10),
       period_end:       periodEnd.toISOString().slice(0, 10),
       reasoning:        `Rolling avg Rs ${rollingAvg} (3-period, 80% sandbag-floor applied); missed < Rs ${missedThreshold}, growth ≥ Rs ${growthThreshold}`,
-      set_at:           admin.firestore.FieldValue.serverTimestamp(),
     };
   }
 
-  await db.collection('customers').doc(customerId)
-    .collection('period_targets').doc(periodKey)
-    .set(targetDoc);
+  await periodDocRef.set({
+    target: target,
+    set_at: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
 
   console.log(
     `[reward] setPeriodTarget ${customerId} | ${periodKey} | ` +
-    `${isColdStart ? `cold-start M${coldStartMonth}` : `avg=Rs ${targetDoc.rolling_average}`} | ` +
-    targetDoc.reasoning
+    `${isColdStart ? `cold-start M${coldStartMonth}` : `avg=Rs ${target.rolling_average}`} | ` +
+    target.reasoning
   );
-  return { periodKey, targetAmount: targetDoc.target_amount, coldStart: isColdStart, skipped: false };
+  return { periodKey, targetAmount: target.target_amount, coldStart: isColdStart, skipped: false };
 }
 
 // ── Function 2: decideDailyMessage ────────────────────────────────────────────
@@ -446,34 +466,34 @@ async function setPeriodTarget(customerId, salesDate) {
 async function decideDailyMessage(customerId, todaysPurchaseAmount, salesDate) {
   const today = salesDate ?? _nowFn();
 
-  const snap = await db.collection('customers').doc(customerId).get();
+  const snap = await customerRef(customerId).get();
   if (!snap.exists) return { skipped: true, reason: 'customer not found' };
 
   const profile = snap.data().profile ?? {};
   const isDW    = isDisplayWallCustomer(profile);
-  const periodKey = getPeriodKey(today, isDW);
+  const primaryId = _primaryId(profile, customerId);
+  const periodKey  = getPeriodKey(today, isDW);
+  const storageKey = fiscalPeriodKey(today, isDW);
   const { start: periodStart, end: periodEnd } = getPeriodBounds(today, isDW);
 
   const daysLeft  = daysUntilPeriodEnd(today, isDW);
   const isNearEnd = daysLeft <= 4; // last 5 days of period
 
   // Fetch current period target (fallback to profile.tier_threshold)
-  const targetSnap   = await db.collection('customers').doc(customerId)
-    .collection('period_targets').doc(periodKey).get();
-  const targetAmount = targetSnap.exists
-    ? (targetSnap.data().target_amount ?? 0)
+  const periodSnap   = await periodRef(customerId, primaryId, storageKey).get();
+  const targetAmount = periodSnap.exists && periodSnap.data()?.target
+    ? (periodSnap.data().target.target_amount ?? 0)
     : (profile.tier_threshold ?? 0);
 
   // MTD and progress — pure arithmetic, never sent to Claude for computation
-  const mtdTotal    = await fetchPeriodSales(customerId, periodStart, today);
+  const mtdTotal    = await fetchPeriodSales(customerId, profile.linked_ids, isDW, periodStart, today);
   const progressPct = targetAmount > 0 ? Math.round((mtdTotal / targetAmount) * 100) : 0;
   const targetLeft  = Math.max(0, targetAmount - mtdTotal);
 
   // Message budget check — MUST happen BEFORE any Claude call (zero API cost when exhausted)
-  const budgetSnap     = await db.collection('customers').doc(customerId)
-    .collection('message_budget').doc(periodKey).get();
-  const sentThisPeriod = budgetSnap.exists ? (budgetSnap.data().sent ?? 0) : 0;
-  const maxAllowed     = _getBudgetMax(profile, isDW);
+  const budget          = periodSnap.exists ? (periodSnap.data().message_budget ?? null) : null;
+  const sentThisPeriod  = budget?.sent ?? 0;
+  const maxAllowed      = _getBudgetMax(profile, isDW);
 
   if (sentThisPeriod >= maxAllowed) {
     console.log(
@@ -526,16 +546,16 @@ async function decideDailyMessage(customerId, todaysPurchaseAmount, salesDate) {
     return { skipped: true, reason: 'Sonnet decided to conserve message budget' };
   }
 
-  // Budget slot consumed — increment counter
-  await db.collection('customers').doc(customerId)
-    .collection('message_budget').doc(periodKey)
-    .set({
+  // Budget slot consumed — increment counter, on the same period doc as the target.
+  await periodRef(customerId, primaryId, storageKey).set({
+    message_budget: {
       period_key:  periodKey,
       sent:        sentThisPeriod + 1,
       max_allowed: maxAllowed,
       tier:        profile.tier ?? 'Saathi',
       updated_at:  admin.firestore.FieldValue.serverTimestamp(),
-    });
+    },
+  }, { merge: true });
 
   console.log(
     `[reward] decideDailyMessage ${customerId} | ${periodKey} | ` +
@@ -552,21 +572,26 @@ async function decideDailyMessage(customerId, todaysPurchaseAmount, salesDate) {
 async function checkPeriodEndBonus(customerId, salesDate) {
   const today = salesDate ?? _nowFn();
 
-  const snap = await db.collection('customers').doc(customerId).get();
+  const snap = await customerRef(customerId).get();
   if (!snap.exists) return { skipped: true, reason: 'customer not found' };
 
   const profile   = snap.data().profile ?? {};
   const isDW      = isDisplayWallCustomer(profile);
-  const periodKey = getPeriodKey(today, isDW);
+  const primaryId = _primaryId(profile, customerId);
+  const periodKey  = getPeriodKey(today, isDW);
+  const storageKey = fiscalPeriodKey(today, isDW);
   const { start: periodStart, end: periodEnd } = getPeriodBounds(today, isDW);
 
-  // Idempotent: skip if bonus already recorded for this period
-  const bonusSnap = await db.collection('customers').doc(customerId)
-    .collection('period_bonuses').doc(periodKey).get();
-  if (bonusSnap.exists) {
+  const periodDocRef = periodRef(customerId, primaryId, storageKey);
+  const periodSnap    = await periodDocRef.get();
+
+  // Idempotent: skip if bonus already recorded (period locked) for this period
+  if (periodSnap.exists && periodSnap.data()?.locked === true) {
     console.log(`[reward] checkPeriodEndBonus ${customerId} | ${periodKey} | already paid, skipping`);
     return { skipped: true, reason: 'bonus already paid', periodKey };
   }
+
+  const existingTarget = periodSnap.exists ? (periodSnap.data().target ?? null) : null;
 
   // ── Display Wall bracket system ───────────────────────────────────────────────
   // Under 110% (or 108% onboarding) → 1% only.
@@ -574,24 +599,25 @@ async function checkPeriodEndBonus(customerId, salesDate) {
   // ≥ threshold, product confirmed     → 3% total (absolute ceiling).
   // No loyalty top-up for DW. No consecutive_months tracking for DW.
   if (isDW) {
-    const dwTargetSnap = await db.collection('customers').doc(customerId)
-      .collection('period_targets').doc(periodKey).get();
-    if (!dwTargetSnap.exists) {
+    if (!existingTarget) {
       console.log(`[reward] checkPeriodEndBonus ${customerId} | ${periodKey} | DW: no target set, skipping`);
       return { skipped: true, reason: 'no period target set', periodKey };
     }
 
-    const dwTarget       = dwTargetSnap.data();
-    const dwGrowthThresh = dwTarget.growth_threshold ?? 0;
-    const productDone    = dwTarget.product_completed ?? false;
-    const isNewAccount   = dwTarget.new_account ?? false;
+    const dwGrowthThresh = existingTarget.growth_threshold ?? 0;
+    const productDone    = existingTarget.product_completed ?? false;
+    const isNewAccount   = existingTarget.new_account ?? false;
 
-    const dwLinkedIds    = profile.linked_ids ?? [];
     const dwStoreCode    = await _getRcmStoreCode();
     const dwExcludeIds   = dwStoreCode ? new Set([String(dwStoreCode)]) : null;
-    const dwRawSales     = await fetchPeriodSales(customerId, periodStart, periodEnd, dwExcludeIds);
-    const dwReturns      = await fetchPeriodReturns(customerId, dwLinkedIds, periodStart, periodEnd);
-    const dwGenuineSales = Math.max(0, dwRawSales - dwReturns);
+    const dwRawSalesComputed = await fetchPeriodSales(customerId, profile.linked_ids, isDW, periodStart, periodEnd, dwExcludeIds);
+    const dwReturnsComputed  = await fetchPeriodReturns(customerId, profile.linked_ids, isDW, periodStart, periodEnd);
+    const dwGenuineComputed  = Math.max(0, dwRawSalesComputed - dwReturnsComputed);
+    // Gemini aggregation pass: narrates these already-computed numbers into ai_notes;
+    // the bracket math below reads its returned (identical) genuineSales value.
+    const { aggregatePeriodSummary } = require('./period-aggregator');
+    const { genuineSales: dwGenuineSales, rawSales: dwRawSales, returns: dwReturns } =
+      await aggregatePeriodSummary(customerId, primaryId, periodStart, isDW, dwRawSalesComputed, dwReturnsComputed, dwGenuineComputed);
 
     let dwBracket   = 'missed';
     let dwBonusRs   = 0;
@@ -621,23 +647,22 @@ async function checkPeriodEndBonus(customerId, salesDate) {
       console.warn(`[reward] C5/C6 CEILING: ${customerId} | ${periodKey} | DW bonus capped to Rs ${dwBonusRs}`);
     }
 
-    const dwIdUsed     = (profile.linked_ids ?? [])[0] ?? customerId;
-    const dwBillRef    = `BONUS-${periodKey}`;
+    const dwBillRef = `BONUS-${periodKey}`;
     let   dwBonusResult = { applied: false, amount: 0 };
 
     if (dwBonusRs > 0) {
       const lr = await applyCredit(
-        customerId, dwIdUsed, dwBonusRs,
+        customerId, primaryId, dwBonusRs,
         dwBracket === 'growth_with_product' ? 'DW growth+product bonus (period end)' : 'DW growth bonus (period end)',
-        dwBillRef
+        dwBillRef, today
       );
       dwBonusResult = { applied: true, amount: dwBonusRs, ledgerResult: lr };
     }
 
-    await db.collection('customers').doc(customerId)
-      .collection('period_bonuses').doc(periodKey)
-      .set({
-        period_key:        periodKey,
+    await periodDocRef.set({
+      locked: true,
+      target: {
+        ...existingTarget,
         bracket:           dwBracket,
         bonus_rs:          dwBonusRs,
         loyalty_topup_rs:  0,
@@ -646,9 +671,10 @@ async function checkPeriodEndBonus(customerId, salesDate) {
         capped:            dwCapped,
         genuine_sales:     dwGenuineSales,
         product_completed: productDone,
-        applied_at:        admin.firestore.FieldValue.serverTimestamp(),
-        reasoning:         dwReasoning,
-      });
+        bonus_reasoning:   dwReasoning,
+      },
+      applied_at: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
 
     console.log(
       `[reward] checkPeriodEndBonus ${customerId} | ${periodKey} | ` +
@@ -669,24 +695,25 @@ async function checkPeriodEndBonus(customerId, salesDate) {
   // ── AB ID path ────────────────────────────────────────────────────────────────
 
   // Must have a target set for this period
-  const targetSnap = await db.collection('customers').doc(customerId)
-    .collection('period_targets').doc(periodKey).get();
-  if (!targetSnap.exists) {
+  if (!existingTarget) {
     console.log(`[reward] checkPeriodEndBonus ${customerId} | ${periodKey} | no target set, skipping`);
     return { skipped: true, reason: 'no period target set', periodKey };
   }
 
-  const targetData     = targetSnap.data();
-  const isColdStart    = targetData.cold_start ?? false;
-  const coldStartMonth = targetData.cold_start_month ?? null;
+  const isColdStart    = existingTarget.cold_start ?? false;
+  const coldStartMonth = existingTarget.cold_start_month ?? null;
 
   // Genuine sales = raw purchases − returns in period (ST Rupees store-code bills excluded)
-  const linkedIds    = profile.linked_ids ?? [];
   const abStoreCode  = await _getRcmStoreCode();
   const abExcludeIds = abStoreCode ? new Set([String(abStoreCode)]) : null;
-  const rawSales     = await fetchPeriodSales(customerId, periodStart, periodEnd, abExcludeIds);
-  const returns      = await fetchPeriodReturns(customerId, linkedIds, periodStart, periodEnd);
-  const genuineSales = Math.max(0, rawSales - returns);
+  const rawSalesComputed = await fetchPeriodSales(customerId, profile.linked_ids, isDW, periodStart, periodEnd, abExcludeIds);
+  const returnsComputed  = await fetchPeriodReturns(customerId, profile.linked_ids, isDW, periodStart, periodEnd);
+  const genuineComputed  = Math.max(0, rawSalesComputed - returnsComputed);
+  // Gemini aggregation pass: narrates these already-computed numbers into ai_notes;
+  // the bracket math below reads its returned (identical) genuineSales value.
+  const { aggregatePeriodSummary } = require('./period-aggregator');
+  const { genuineSales, rawSales, returns } =
+    await aggregatePeriodSummary(customerId, primaryId, periodStart, isDW, rawSalesComputed, returnsComputed, genuineComputed);
 
   // ── Bracket determination ─────────────────────────────────────────────────────
   let bracket   = 'missed';
@@ -701,7 +728,7 @@ async function checkPeriodEndBonus(customerId, salesDate) {
 
   } else if (isColdStart) {
     // Cold-start months 2 & 3: binary hit/miss against the stored ramp target
-    const coldTarget = targetData.target_amount ?? 0;
+    const coldTarget = existingTarget.target_amount ?? 0;
     if (genuineSales >= coldTarget) {
       bracket   = 'maintenance';
       bonusRs   = Math.floor(genuineSales * 0.005);  // +0.5% → 1.5% total with L1
@@ -714,9 +741,9 @@ async function checkPeriodEndBonus(customerId, salesDate) {
 
   } else {
     // Full 3-bracket system against rolling average
-    const rollingAvg      = targetData.rolling_average ?? 0;
-    const missedThreshold = targetData.missed_threshold ?? Math.round(rollingAvg * 0.90);
-    const growthThreshold = targetData.growth_threshold ?? Math.round(rollingAvg * 1.05);
+    const rollingAvg      = existingTarget.rolling_average ?? 0;
+    const missedThreshold = existingTarget.missed_threshold ?? Math.round(rollingAvg * 0.90);
+    const growthThreshold = existingTarget.growth_threshold ?? Math.round(rollingAvg * 1.05);
 
     if (genuineSales < missedThreshold) {
       bracket   = 'missed';
@@ -742,7 +769,7 @@ async function checkPeriodEndBonus(customerId, salesDate) {
 
   if (bracket !== 'missed' && newConsecutive % 3 === 0) {
     // Fetch last 2 completed periods to compute the 3-month combined total
-    const hist       = await fetchPurchaseHistory(customerId, isDW, 6);
+    const hist       = await fetchPurchaseHistory(customerId, profile.linked_ids, isDW, 6);
     const prev2      = hist.filter(h => h.period < periodKey).slice(-2);
     const prev2Total = prev2.reduce((s, h) => s + h.total, 0);
     const combined3  = rawSales + prev2Total;
@@ -770,38 +797,37 @@ async function checkPeriodEndBonus(customerId, salesDate) {
   }
 
   // ── Apply credits via ledger-writer ───────────────────────────────────────────
-  const idUsed           = linkedIds[0] ?? customerId;
   const syntheticBillRef = `BONUS-${periodKey}`;
   let bonusResult   = { applied: false, amount: 0 };
   let loyaltyResult = { applied: false, amount: 0 };
 
   if (bonusRs > 0) {
     const lr = await applyCredit(
-      customerId, idUsed, bonusRs,
+      customerId, primaryId, bonusRs,
       bracket === 'growth' ? 'growth bonus (period end)' : 'maintenance bonus (period end)',
-      syntheticBillRef
+      syntheticBillRef, today
     );
     bonusResult = { applied: true, amount: bonusRs, ledgerResult: lr };
   }
   if (loyaltyTopupRs > 0) {
     const lr = await applyCredit(
-      customerId, idUsed, loyaltyTopupRs,
-      'loyalty top-up (3-month streak)', syntheticBillRef
+      customerId, primaryId, loyaltyTopupRs,
+      'loyalty top-up (3-month streak)', syntheticBillRef, today
     );
     loyaltyResult = { applied: true, amount: loyaltyTopupRs, ledgerResult: lr };
   }
 
   // ── Update profile.consecutive_months ────────────────────────────────────────
-  await db.collection('customers').doc(customerId).set(
+  await customerRef(customerId).set(
     { profile: { consecutive_months: newConsecutive } },
     { merge: true }
   );
 
-  // ── Write bonus record (idempotency guard for future runs) ────────────────────
-  await db.collection('customers').doc(customerId)
-    .collection('period_bonuses').doc(periodKey)
-    .set({
-      period_key:               periodKey,
+  // ── Write bonus record (idempotency guard for future runs) — locks the period ──
+  await periodDocRef.set({
+    locked: true,
+    target: {
+      ...existingTarget,
       bracket,
       bonus_rs:                 bonusRs,
       loyalty_topup_rs:         loyaltyTopupRs,
@@ -810,9 +836,10 @@ async function checkPeriodEndBonus(customerId, salesDate) {
       capped,
       genuine_sales:            genuineSales,
       consecutive_months_after: newConsecutive,
-      applied_at:               admin.firestore.FieldValue.serverTimestamp(),
-      reasoning,
-    });
+      bonus_reasoning:          reasoning,
+    },
+    applied_at: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
 
   console.log(
     `[reward] checkPeriodEndBonus ${customerId} | ${periodKey} | ` +
@@ -826,7 +853,7 @@ async function checkPeriodEndBonus(customerId, salesDate) {
     loyalty: loyaltyResult,
     capped,
     genuineSales,
-    targetAmount: targetData.target_amount ?? 0,
+    targetAmount: existingTarget.target_amount ?? 0,
     skipped: false,
   };
 }
@@ -885,5 +912,11 @@ module.exports = {
   decideDailyMessage,
   checkPeriodEndBonus,
   runNightlyRewardChecks,
+  isDisplayWallCustomer,
+  getPeriodBounds,
+  getPeriodKey,
+  parseDate,
+  fetchPeriodSales,
+  fetchPeriodReturns,
   _setNow,
 };

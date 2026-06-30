@@ -87,20 +87,11 @@ https.request = (opts, callback) => {
   req.write = () => {};
   req.end   = () => {
     process.nextTick(() => {
-      let body;
-      if (opts?.hostname === 'generativelanguage.googleapis.com') {
-        geminiCallCount++;
-        body = JSON.stringify({
-          candidates: [{
-            content: { parts: [{ text: '{"gender":"F","name_cleaned":"Priya Sharma"}' }] },
-          }],
-        });
-      } else {
-        // Telegram — capture sent messages
-        const rawBody = req._body ?? '';
-        try { telegramMessages.push(JSON.parse(rawBody)); } catch {}
-        body = JSON.stringify({ ok: true });
-      }
+      // Telegram — capture sent messages (Gemini no longer goes through https — see
+      // the @google/genai mock below, which is the SDK telegram-listener.js now uses).
+      const rawBody = req._body ?? '';
+      try { telegramMessages.push(JSON.parse(rawBody)); } catch {}
+      const body = JSON.stringify({ ok: true });
       res.emit('data', body);
       res.emit('end');
     });
@@ -123,6 +114,22 @@ injectMock(pathMod.join(ROOT, 'vault-read.js'), {
   getCredential: async (category) => {
     if (category === 'gemini_api') return { api_key: 'test-gemini-key' };
     return { bot_token: 'test_token', admin_chat_id: '123456' };
+  },
+});
+
+// telegram-listener.js calls Gemini via the @google/genai Vertex SDK, not raw https —
+// mock that SDK directly so this test never makes a real network/API call.
+injectMock(require.resolve('@google/genai'), {
+  GoogleGenAI: class {
+    constructor() {}
+    get models() {
+      return {
+        generateContent: async () => {
+          geminiCallCount++;
+          return { text: JSON.stringify({ gender: 'F', name_cleaned: 'Priya Sharma' }) };
+        },
+      };
+    }
   },
 });
 
@@ -191,9 +198,8 @@ async function scenarioA() {
 
   const custDoc  = store.get('customers/9876543210');
   const profile  = custDoc?.profile;
-  const ledger   = store.get('customers/9876543210/st_rupees_ledger/AB12345');
+  const idDoc    = store.get('customers/9876543210/ids/AB12345');
   const advice   = store.get('customers/9876543210/behavior_advice/AB12345');
-  const targets  = store.get('customers/9876543210/targets/current');
   const pending  = store.get('pending_party_codes/AB12345');
   const lastMsg  = telegramMessages[telegramMessages.length - 1]?.text ?? '';
 
@@ -205,15 +211,14 @@ async function scenarioA() {
   pass &= check('profile.gender', profile?.gender, 'F');
   pass &= check('profile.tier', profile?.tier, 'Bronze');
   pass &= check('profile.language', profile?.language, 'hi');
-  pass &= check('profile.is_active', profile?.is_active, true);
-  pass &= check('profile.linked_ids[0]', profile?.linked_ids?.[0], 'AB12345');
-  pass &= checkTruthy('st_rupees_ledger/AB12345 created', ledger);
-  pass &= check('ledger.current_balance', ledger?.current_balance, 0);
-  pass &= check('ledger.lifetime_earned', ledger?.lifetime_earned, 0);
-  pass &= check('ledger.lifetime_redeemed', ledger?.lifetime_redeemed, 0);
+  pass &= check('profile.status', profile?.status, 'active');
+  pass &= check('profile.linked_ids[0].id', profile?.linked_ids?.[0]?.id, 'AB12345');
+  pass &= check('profile.linked_ids[0].type', profile?.linked_ids?.[0]?.type, 'ab_id');
+  pass &= check('profile.linked_id_values[0]', profile?.linked_id_values?.[0], 'AB12345');
+  pass &= checkTruthy('ids/AB12345 created', idDoc);
+  pass &= check('idDoc.current_balance', idDoc?.current_balance, 0);
+  pass &= check('idDoc.debt', idDoc?.debt, 0);
   pass &= checkTruthy('behavior_advice/AB12345 created', advice);
-  pass &= checkTruthy('targets/current created', targets);
-  pass &= check('targets.current', targets?.current, null);
   pass &= check('pending status → resolved', pending?.status, 'resolved');
   pass &= check('pending mobile linked', pending?.mobile, '9876543210');
   pass &= checkContains('confirmation includes Firestore path', lastMsg, 'customers/9876543210');
@@ -256,7 +261,7 @@ async function scenarioB() {
   pass &= check('profile.tier', profile?.tier, 'Bronze');
   pass &= check('profile.language', profile?.language, 'hi');
   pass &= check('pending status → resolved', pending?.status, 'resolved');
-  pass &= checkTruthy('st_rupees_ledger created', store.get('customers/9876543210/st_rupees_ledger/AB12345'));
+  pass &= checkTruthy('id doc created', store.get('customers/9876543210/ids/AB12345'));
 
   console.log(`\n  ${pass ? 'ALL CHECKS PASSED ✓' : 'SOME CHECKS FAILED ✗'}`);
   return !!pass;

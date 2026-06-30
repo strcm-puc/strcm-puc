@@ -1,50 +1,39 @@
 'use strict';
 
-const https = require('https');
+const path = require('path');
+const { GoogleGenAI } = require('@google/genai');
 const { db, admin } = require('../firebase-config');
-const { getCredential } = require('../vault-read');
 const { getApprovedTemplates } = require('./template-cache');
 
-let _geminiKey;
+const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 
-async function _getGeminiKey() {
-  if (_geminiKey !== undefined) return _geminiKey;
-  try {
-    const c = await getCredential('gemini_api');
-    _geminiKey = String(c.api_key).trim();
-  } catch (e) { console.warn('[writer] Gemini creds unavailable:', e.message); _geminiKey = null; }
-  return _geminiKey;
+process.env.GOOGLE_APPLICATION_CREDENTIALS ??=
+  path.join(__dirname, '..', 'secrets', 'firebase-service-account.json');
+
+let _ai;
+
+function _getAi() {
+  if (!_ai) {
+    _ai = new GoogleGenAI({
+      vertexai: true,
+      project:  'strcm-apex-500420',
+      location: 'us-central1',
+    });
+  }
+  return _ai;
 }
 
 async function _callGemini(prompt) {
-  const key = await _getGeminiKey();
-  if (!key) throw new Error('Gemini credentials not available');
-  const body = JSON.stringify({
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: { responseMimeType: 'application/json' },
+  const response = await _getAi().models.generateContent({
+    model:    GEMINI_MODEL,
+    contents: prompt,
+    config:   { responseMimeType: 'application/json' },
   });
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'generativelanguage.googleapis.com',
-      path:     `/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
-      method:   'POST',
-      headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, (res) => {
-      let raw = '';
-      res.on('data', c => raw += c);
-      res.on('end',  () => {
-        try {
-          const parsed = JSON.parse(raw);
-          if (parsed.error) return reject(new Error(parsed.error.message ?? 'Gemini API error'));
-          const text  = parsed.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}';
-          const match = text.match(/\{[\s\S]*\}/);
-          resolve(JSON.parse(match?.[0] ?? '{}'));
-        } catch (e) { reject(new Error(`Gemini parse failed: ${e.message}`)); }
-      });
-    });
-    req.on('error', reject);
-    req.write(body); req.end();
-  });
+  const text  = response.text ?? '{}';
+  const match = text.match(/\{[\s\S]*\}/);
+  try {
+    return JSON.parse(match?.[0] ?? '{}');
+  } catch (e) { throw new Error(`Gemini parse failed: ${e.message}`); }
 }
 
 // ── Message history helpers ────────────────────────────────────────────────────

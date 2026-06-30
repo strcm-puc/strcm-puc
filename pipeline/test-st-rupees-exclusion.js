@@ -54,12 +54,18 @@ function makeFirestoreStore() {
       add: async (data) => { const id = `a_${Math.random().toString(36).slice(2)}`; store.set(`${colPath}/${id}`, data); return { id }; },
       where: () => ({ limit: () => ({ get: async () => ({ empty: true, docs: [] }) }) }),
       get: async () => {
+        // Real Firestore allows "phantom" parent docs — addressable purely by having
+        // a subcollection beneath them. Dedupe on the immediate child segment.
         const prefix = colPath + '/';
-        const docs = [];
-        for (const [k, v] of store) {
-          if (!k.startsWith(prefix) || k.slice(prefix.length).includes('/')) continue;
-          docs.push({ id: k.split('/').pop(), data: () => v });
+        const seen   = new Map();
+        for (const k of store.keys()) {
+          if (!k.startsWith(prefix)) continue;
+          const id = k.slice(prefix.length).split('/')[0];
+          if (!seen.has(id)) seen.set(id, `${prefix}${id}`);
         }
+        const docs = [...seen.entries()].map(([id, docPath]) => ({
+          id, data: () => store.get(docPath) ?? {}, ref: makeDocRef(docPath),
+        }));
         return { docs };
       },
     };
@@ -68,6 +74,17 @@ function makeFirestoreStore() {
   const mockDb    = { collection: makeCollRef };
   return { store, mockDb, mockAdmin };
 }
+
+// checkPeriodEndBonus's Gemini aggregation pass calls Gemini via the @google/genai
+// Vertex SDK — mock it so this test never makes a real network/API call.
+injectMock(require.resolve('@google/genai'), {
+  GoogleGenAI: class {
+    constructor() {}
+    get models() {
+      return { generateContent: async () => ({ text: JSON.stringify({ summary: 'Test period summary.' }) }) };
+    }
+  },
+});
 
 function freshRC(mockDb, mockAdmin) {
   injectMock(pathMod.join(ROOT, 'vault-read.js'), {
@@ -79,8 +96,16 @@ function freshRC(mockDb, mockAdmin) {
   injectMock(pathMod.join(ROOT, 'firebase-config.js'), { db: mockDb, admin: mockAdmin });
   delete require.cache[require.resolve('./reward-calculator')];
   delete require.cache[require.resolve('./ledger-writer')];
+  delete require.cache[require.resolve('./customer-schema')];
+  delete require.cache[require.resolve('./period-aggregator')];
   return require('./reward-calculator');
 }
+
+const { fiscalPeriodKey } = (() => {
+  injectMock(pathMod.join(ROOT, 'firebase-config.js'), { db: { collection: () => ({}) }, admin: {} });
+  delete require.cache[require.resolve('./customer-schema')];
+  return require('./customer-schema');
+})();
 
 // ── Assertion helpers ──────────────────────────────────────────────────────────
 
@@ -174,32 +199,41 @@ async function case3() {
   // Period under test: 2026-06
   const TODAY  = new Date('2026-06-30');
 
+  // STORE_CODE is tagged as a (synthetic) second linked id purely so this test can
+  // exercise the exclusion path in fetchPeriodSales — in real data a redemption bill's
+  // id_used would never be a genuine linked id of any customer.
   store.set(`customers/${MOBILE}`, {
-    profile: { linked_ids: [AB_ID], name: 'Test', gender: 'M', tier: 'Saathi', consecutive_months: 2 },
+    profile: {
+      linked_ids: [{ id: AB_ID, type: 'ab_id' }, { id: STORE_CODE, type: 'ab_id' }],
+      name: 'Test', gender: 'M', tier: 'Saathi', consecutive_months: 2,
+    },
   });
 
   // 3 months of real history (Mar, Apr, May — all 5000)
-  store.set(`customers/${MOBILE}/purchase_summary/h0`, { date: '2026-03-15', amount: '5000', id_used: AB_ID });
-  store.set(`customers/${MOBILE}/purchase_summary/h1`, { date: '2026-04-15', amount: '5000', id_used: AB_ID });
-  store.set(`customers/${MOBILE}/purchase_summary/h2`, { date: '2026-05-15', amount: '5000', id_used: AB_ID });
+  store.set(`customers/${MOBILE}/ids/${AB_ID}/periods/${fiscalPeriodKey(new Date('2026-03-15'), false)}/purchases/h0`, { date: '2026-03-15', amount: '5000', id_used: AB_ID });
+  store.set(`customers/${MOBILE}/ids/${AB_ID}/periods/${fiscalPeriodKey(new Date('2026-04-15'), false)}/purchases/h1`, { date: '2026-04-15', amount: '5000', id_used: AB_ID });
+  store.set(`customers/${MOBILE}/ids/${AB_ID}/periods/${fiscalPeriodKey(new Date('2026-05-15'), false)}/purchases/h2`, { date: '2026-05-15', amount: '5000', id_used: AB_ID });
 
   // June: one normal purchase (4000) + one store-code transaction (3000)
-  store.set(`customers/${MOBILE}/purchase_summary/h3`, { date: '2026-06-15', amount: '4000', id_used: AB_ID });
-  store.set(`customers/${MOBILE}/purchase_summary/h4`, { date: '2026-06-20', amount: '3000', id_used: STORE_CODE });
+  const juneKey = fiscalPeriodKey(new Date('2026-06-15'), false); // FY2627-06
+  store.set(`customers/${MOBILE}/ids/${AB_ID}/periods/${juneKey}/purchases/h3`, { date: '2026-06-15', amount: '4000', id_used: AB_ID });
+  store.set(`customers/${MOBILE}/ids/${STORE_CODE}/periods/${juneKey}/purchases/h4`, { date: '2026-06-20', amount: '3000', id_used: STORE_CODE });
 
   // Set the June period target — rolling avg 5000, growth threshold 5250 (105%)
-  store.set(`customers/${MOBILE}/period_targets/2026-06`, {
-    period_key:        '2026-06',
-    target_amount:     5250,
-    rolling_average:   5000,
-    cold_start:        false,
-    cold_start_month:  null,
-    missed_threshold:  4500,   // 90%
-    growth_threshold:  5250,   // 105%
-    period_start:      '2026-06-01',
-    period_end:        '2026-06-30',
-    reasoning:         'test',
-    set_at:            '2026-06-01T00:00:00Z',
+  store.set(`customers/${MOBILE}/ids/${AB_ID}/periods/${juneKey}`, {
+    target: {
+      period_key:        '2026-06',
+      target_amount:     5250,
+      rolling_average:   5000,
+      cold_start:        false,
+      cold_start_month:  null,
+      missed_threshold:  4500,   // 90%
+      growth_threshold:  5250,   // 105%
+      period_start:      '2026-06-01',
+      period_end:        '2026-06-30',
+      reasoning:         'test',
+      set_at:            '2026-06-01T00:00:00Z',
+    },
   });
 
   let creditCalls = [];

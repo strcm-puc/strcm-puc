@@ -9,7 +9,7 @@
 //
 // All external APIs mocked:
 //   graph.facebook.com (templates + messages)
-//   generativelanguage.googleapis.com (Gemini)
+//   @google/genai Vertex SDK (Gemini)
 //   api.telegram.org (Telegram)
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -114,24 +114,7 @@ https.request = (opts, callback) => {
       const host = opts?.hostname ?? '';
       const path = opts?.path ?? '';
 
-      if (host === 'generativelanguage.googleapis.com') {
-        geminiCallCount++;
-        // Simulate Gemini selecting a template and writing a Hindi message
-        const mockGeminiResponse = {
-          template_name:     'st_purchase_thanks_hindi',
-          template_language: 'hi',
-          body_variables:    ['प्रिया', 'Rs 45'],
-          header_variables:  [],
-          message_preview:   'जय RCM!\nप्रिया जी, आपकी खरीदारी के लिए शुक्रिया। आपके ST खाते में Rs 45 जमा हुए।',
-          opener:            'आपकी खरीदारी के लिए',
-        };
-        body = JSON.stringify({
-          candidates: [{
-            content: { parts: [{ text: JSON.stringify(mockGeminiResponse) }] },
-          }],
-        });
-
-      } else if (host === 'graph.facebook.com' && path.includes('message_templates')) {
+      if (host === 'graph.facebook.com' && path.includes('message_templates')) {
         metaFetchCount++;
         body = JSON.stringify({ data: MOCK_TEMPLATES });
 
@@ -177,6 +160,30 @@ injectMock(pathMod.join(ROOT, 'vault-read.js'), {
   },
 });
 
+// message-writer.js calls Gemini via the @google/genai Vertex SDK, not raw https —
+// mock that SDK directly so this test never makes a real network/API call.
+injectMock(require.resolve('@google/genai'), {
+  GoogleGenAI: class {
+    constructor() {}
+    get models() {
+      return {
+        generateContent: async () => {
+          geminiCallCount++;
+          const mockGeminiResponse = {
+            template_name:     'st_purchase_thanks_hindi',
+            template_language: 'hi',
+            body_variables:    ['प्रिया', 'Rs 45'],
+            header_variables:  [],
+            message_preview:   'जय RCM!\nप्रिया जी, आपकी खरीदारी के लिए शुक्रिया। आपके ST खाते में Rs 45 जमा हुए।',
+            opener:            'आपकी खरीदारी के लिए',
+          };
+          return { text: JSON.stringify(mockGeminiResponse) };
+        },
+      };
+    }
+  },
+});
+
 // ── Seed customer ──────────────────────────────────────────────────────────────
 
 const MOBILE = '9876543210';
@@ -184,7 +191,8 @@ store.set(`customers/${MOBILE}`, {
   profile: {
     name:               'प्रिया',
     gender:             'F',
-    linked_ids:         ['AB9001'],
+    linked_ids:         [{ id: 'AB9001', type: 'ab_id' }],
+    linked_id_values:   ['AB9001'],
     tier:               'Saathi',
     consecutive_months: 3,
     unsubscribed:       false,
