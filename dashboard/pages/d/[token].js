@@ -18,25 +18,66 @@ export default function DashboardTokenPage({ data }) {
   );
 }
 
-// ── Firestore helpers (server-side only) ──────────────────────────────────────
+// ── Firestore helpers (client SDK, read-only — see /firestore.rules) ──────────
+// This page must never import firebase-admin (../../../firebase-config) or any
+// pipeline/*.js backend module — those carry privileged write access, vault
+// credential access, and even Anthropic/Gemini call paths that have no business
+// being reachable from a public customer-facing page. Everything this page
+// needs is read directly here via the Firebase client SDK, gated by
+// read-only Firestore Security Rules, not by service-account privilege.
+
+import {
+  collection, query, where, limit, getDocs, doc, getDoc,
+} from 'firebase/firestore';
+import { getDb } from '../../lib/firebase-client';
+import { getPeriodBounds, fiscalPeriodKey, isDisplayWallProfile } from '../../lib/period-utils';
+
+// Sum a customer's lifetime earned/redeemed ST Rupees across every period
+// folder, for whichever linked-ID type matches their classification — the
+// exact same restriction pipeline/customer-progress.js:getCustomerProgress
+// applies, reimplemented here with the client SDK instead of imported.
+async function getLifetimeProgress(db, mobile, linkedIds, isDW) {
+  const matchingIds = linkedIds
+    .filter((li) => li.type === (isDW ? 'display_wall' : 'ab_id'))
+    .map((li) => li.id);
+
+  let lifetimeEarned = 0;
+  let lifetimeRedeemed = 0;
+
+  for (const id of matchingIds) {
+    const periodsSnap = await getDocs(collection(db, 'customers', mobile, 'ids', id, 'periods'));
+    for (const periodDoc of periodsSnap.docs) {
+      const entriesSnap = await getDocs(
+        collection(db, 'customers', mobile, 'ids', id, 'periods', periodDoc.id, 'st_rupees_ledger', 'ledger', 'entries')
+      );
+      for (const e of entriesSnap.docs) {
+        const ed = e.data();
+        const amount = Number(ed.amount ?? 0);
+        if (ed.type === 'credit') lifetimeEarned += amount;
+        if (ed.type === 'debit') lifetimeRedeemed += amount;
+      }
+    }
+  }
+
+  return { lifetimeEarned, lifetimeRedeemed };
+}
 
 export async function getServerSideProps({ params }) {
-  const { db } = require('../../../firebase-config');
-  const { idRef, purchasesCol, fiscalPeriodKey } = require('../../../pipeline/customer-schema');
-  const { getPeriodBounds } = require('../../../pipeline/reward-calculator');
-  const { getCustomerProgress } = require('../../../pipeline/customer-progress');
+  const db = getDb();
   const { token } = params;
 
-  const snap = await db.collection('customers')
-    .where('profile.magic_token', '==', token)
-    .limit(1)
-    .get();
+  const custQuery = query(
+    collection(db, 'customers'),
+    where('profile.magic_token', '==', token),
+    limit(1)
+  );
+  const snap = await getDocs(custQuery);
 
   if (snap.empty) return { notFound: true };
 
-  const doc = snap.docs[0];
-  const mobile = doc.id;
-  const profile = doc.data().profile ?? {};
+  const customerDoc = snap.docs[0];
+  const mobile = customerDoc.id;
+  const profile = customerDoc.data().profile ?? {};
   const linkedIds = profile.linked_ids ?? []; // [{id, type}]
 
   const abIds = linkedIds.filter(li => li.type === 'ab_id').map(li => li.id);
@@ -49,19 +90,19 @@ export async function getServerSideProps({ params }) {
   const dwStorageKey = fiscalPeriodKey(dwPeriodStart, true);
 
   const [ledgerSnaps, abPurchaseSnaps, dwPurchaseSnaps, abTargetSnap, dwTargetSnap] = await Promise.all([
-    Promise.all(linkedIds.map(li => idRef(mobile, li.id).get())),
-    Promise.all(abIds.map(id => purchasesCol(mobile, id, abStorageKey).get())),
-    Promise.all(dwIds.map(id => purchasesCol(mobile, id, dwStorageKey).get())),
-    abIds[0] ? idRef(mobile, abIds[0]).collection('periods').doc(abStorageKey).get() : Promise.resolve(null),
-    dwIds[0] ? idRef(mobile, dwIds[0]).collection('periods').doc(dwStorageKey).get() : Promise.resolve(null),
+    Promise.all(linkedIds.map(li => getDoc(doc(db, 'customers', mobile, 'ids', li.id)))),
+    Promise.all(abIds.map(id => getDocs(collection(db, 'customers', mobile, 'ids', id, 'periods', abStorageKey, 'purchases')))),
+    Promise.all(dwIds.map(id => getDocs(collection(db, 'customers', mobile, 'ids', id, 'periods', dwStorageKey, 'purchases')))),
+    abIds[0] ? getDoc(doc(db, 'customers', mobile, 'ids', abIds[0], 'periods', abStorageKey)) : Promise.resolve(null),
+    dwIds[0] ? getDoc(doc(db, 'customers', mobile, 'ids', dwIds[0], 'periods', dwStorageKey)) : Promise.resolve(null),
   ]);
 
   // Aggregate ledger totals (current_balance only — lifetime_earned/redeemed are
-  // derived elsewhere via customer-progress.js, not needed for this dashboard view)
+  // derived below via getLifetimeProgress, not needed for this dashboard view)
   let available = 0;
   const balanceById = {};
   for (let i = 0; i < linkedIds.length; i++) {
-    if (ledgerSnaps[i].exists) {
+    if (ledgerSnaps[i].exists()) {
       const d = ledgerSnaps[i].data();
       available += Number(d.current_balance ?? 0);
       balanceById[linkedIds[i].id] = Number(d.current_balance ?? 0);
@@ -74,13 +115,13 @@ export async function getServerSideProps({ params }) {
   for (const s of dwPurchaseSnaps) for (const p of s.docs) dwPurchases += Number(p.data().amount ?? 0);
 
   // AB target
-  const abTarget    = abTargetSnap?.exists ? (abTargetSnap.data().target ?? {}) : {};
+  const abTarget    = abTargetSnap?.exists() ? (abTargetSnap.data().target ?? {}) : {};
   const abThreshold = Number(abTarget.growth_threshold ?? 0);
   const abPct       = abThreshold > 0 ? Math.min(Math.round((abPurchases / abThreshold) * 100), 100) : 0;
   const abBalance   = abIds[0] ? (balanceById[abIds[0]] ?? 0) : 0;
 
   // DW target
-  const dwTarget    = dwTargetSnap?.exists ? (dwTargetSnap.data().target ?? {}) : {};
+  const dwTarget    = dwTargetSnap?.exists() ? (dwTargetSnap.data().target ?? {}) : {};
   const dwThreshold = Number(dwTarget.growth_threshold ?? 0);
   const dwPct       = dwThreshold > 0 ? Math.min(Math.round((dwPurchases / dwThreshold) * 100), 100) : 0;
   const dwBalance   = dwIds[0] ? (balanceById[dwIds[0]] ?? 0) : 0;
@@ -109,7 +150,8 @@ export async function getServerSideProps({ params }) {
     }
   }
 
-  const progress = await getCustomerProgress(mobile);
+  const isDW = isDisplayWallProfile(profile);
+  const { lifetimeEarned, lifetimeRedeemed } = await getLifetimeProgress(db, mobile, linkedIds, isDW);
 
   const data = {
     name:            profile.name ?? '',
@@ -131,8 +173,8 @@ export async function getServerSideProps({ params }) {
     productRequired,
     productPurchased,
     productPct,
-    lifetimeEarned:   progress?.lifetime.earned   ?? 0,
-    lifetimeRedeemed: progress?.lifetime.redeemed ?? 0,
+    lifetimeEarned,
+    lifetimeRedeemed,
     available,
     joinDate,
   };

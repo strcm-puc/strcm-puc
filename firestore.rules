@@ -1,0 +1,58 @@
+rules_version = '2';
+
+// Read-only access for the customer dashboard's Firebase client SDK
+// (dashboard/lib/firebase-client.js). Everything else (the pipeline's writes,
+// credential vault, send queue, AI notes, etc.) is reachable only via
+// firebase-admin from trusted backend code, which bypasses these rules
+// entirely — so nothing below needs to authorize any write.
+//
+// The dashboard looks up a customer by profile.magic_token via a `list`
+// query, not a direct doc-ID get (the token is a 12-char random string, not
+// the document ID). `limit(1)` is enforced here so this can never be used to
+// enumerate/dump the full customers collection — a caller must already
+// possess the exact magic_token value to get a match back.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /customers/{mobile} {
+      allow get: if false;
+      allow list: if request.query.limit <= 1;
+      allow write: if false;
+
+      match /ids/{idDoc} {
+        allow get: if true;
+        allow list: if false;
+        allow write: if false;
+
+        match /periods/{periodKey} {
+          allow get: if true;
+          allow list: if false;
+          allow write: if false;
+
+          match /purchases/{bill} {
+            allow get: if false;
+            allow list: if true;
+            allow write: if false;
+          }
+
+          match /st_rupees_ledger/{ledgerDoc} {
+            allow read, write: if false;
+
+            match /entries/{entry} {
+              allow get: if false;
+              allow list: if true;
+              allow write: if false;
+            }
+          }
+        }
+      }
+    }
+
+    // Default deny for everything else — behavior_advice, message_history,
+    // send_queue, system_credentials, system_cache, pending_party_codes,
+    // system/config, and anything not explicitly opened above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
