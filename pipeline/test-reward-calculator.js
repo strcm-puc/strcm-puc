@@ -28,6 +28,10 @@
 // Message budget:
 //   P: Budget exhausted → zero Claude calls, no briefing
 //
+// Launch gate:
+//   R: launch_date unset/future → all reward processing refuses to run;
+//      a purchase dated before launch_date never counts even once live
+//
 // Total Claude calls across all tests: exactly 1 (Test Q's decideDailyMessage
 // call — only test that exercises that path at all; setPeriodTarget and
 // checkPeriodEndBonus never call Claude under the new formula).
@@ -164,6 +168,11 @@ function makeStore() {
     },
   };
 
+  // launch_date gate defaults to "live since 2020" so these bracket-math tests
+  // (all dated 2026) exercise the actual formula, not the not-yet-launched skip path.
+  // Test R below overrides this to verify the unset/pre-launch skip behavior itself.
+  store.set('system/config', { launch_date: '2020-01-01' });
+
   return { store, mockDb, mockAdmin };
 }
 
@@ -241,6 +250,7 @@ function freshRC(store, mockDb, mockAdmin) {
   delete require.cache[require.resolve('./reward-calculator')];
   delete require.cache[require.resolve('./ledger-writer')];
   delete require.cache[require.resolve('./customer-schema')];
+  delete require.cache[require.resolve('./system-config')];
   delete require.cache[require.resolve('./period-aggregator')];
   return require('./reward-calculator');
 }
@@ -1148,11 +1158,78 @@ async function runTestQ() {
   };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// TEST R — launch_date gate (system-config.js): unset/future launch_date blocks
+// ALL reward processing; a pre-launch-dated purchase never counts even once live.
+// ══════════════════════════════════════════════════════════════════════════════
+async function runTestR() {
+  // Part 1: launch_date unset entirely → runNightlyRewardChecks skips, no credit.
+  const { store: store1, mockDb: mockDb1, mockAdmin: mockAdmin1 } = makeStore();
+  store1.delete('system/config'); // undo makeStore()'s default seed — simulate "not launched"
+  const rc1 = freshRC(store1, mockDb1, mockAdmin1);
+  const mobile1 = '7001000018';
+  seedAbHistory(store1, mobile1, {
+    '2026-03': 10000, '2026-04': 10000, '2026-05': 10000, '2026-06': 12000,
+  }, { consecutive: 1 });
+  writeTarget(store1, mobile1, 'AB_TEST', 'FY2627-06', {
+    period_key: '2026-06', target_amount: 10500, rolling_average: 10000,
+    cold_start: false, cold_start_month: null, missed_threshold: 9000, growth_threshold: 10500,
+  });
+  const result1  = await rc1.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
+  const balAfter1 = readLedgerBalance(store1, mobile1, 'AB_TEST') ?? 0;
+  const part1Pass = result1?.skipped === true && balAfter1 === 0;
+
+  // Part 2: launch_date set, but AFTER salesDate → still skipped, no credit.
+  const { store: store2, mockDb: mockDb2, mockAdmin: mockAdmin2 } = makeStore();
+  store2.set('system/config', { launch_date: '2026-07-01' });
+  const rc2 = freshRC(store2, mockDb2, mockAdmin2);
+  const mobile2 = '7001000019';
+  seedAbHistory(store2, mobile2, {
+    '2026-03': 10000, '2026-04': 10000, '2026-05': 10000, '2026-06': 12000,
+  }, { consecutive: 1 });
+  writeTarget(store2, mobile2, 'AB_TEST', 'FY2627-06', {
+    period_key: '2026-06', target_amount: 10500, rolling_average: 10000,
+    cold_start: false, cold_start_month: null, missed_threshold: 9000, growth_threshold: 10500,
+  });
+  const result2  = await rc2.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
+  const balAfter2 = readLedgerBalance(store2, mobile2, 'AB_TEST') ?? 0;
+  const part2Pass = result2?.skipped === true && balAfter2 === 0;
+
+  // Part 3: launch_date IS live for salesDate, but a purchase dated BEFORE launch_date
+  // must never count — only the post-launch purchase feeds the bonus math.
+  const { store: store3, mockDb: mockDb3, mockAdmin: mockAdmin3 } = makeStore();
+  store3.set('system/config', { launch_date: '2026-06-20' });
+  const rc3 = freshRC(store3, mockDb3, mockAdmin3);
+  const mobile3 = '7001000020';
+  seedAbHistory(store3, mobile3, { '2026-06': 12000 }, { consecutive: 1 }); // dated 2026-06-15, BEFORE launch
+  store3.set(`customers/${mobile3}/ids/AB_TEST/periods/FY2627-06/purchases/postlaunch`, {
+    date: '2026-06-25', amount: '5000', // AFTER launch
+  });
+  writeTarget(store3, mobile3, 'AB_TEST', 'FY2627-06', {
+    period_key: '2026-06', target_amount: 3000, rolling_average: 3000,
+    cold_start: false, cold_start_month: null, missed_threshold: 2700, growth_threshold: 3000,
+  });
+  await rc3.runNightlyRewardChecks(new Map(), new Date('2026-06-30'));
+  const bonus3               = readBonus(store3, mobile3, 'AB_TEST', 'FY2627-06');
+  const expectedGenuineSales3 = 5000;               // only the post-launch purchase
+  const expectedBonus3        = Math.floor(5000 * 0.015); // growth bracket, 75
+  const part3Pass = bonus3?.genuine_sales === expectedGenuineSales3 && bonus3?.bonus_rs === expectedBonus3;
+
+  return {
+    name:        'R — launch_date gate: unset/future blocks everything; pre-launch purchases never count',
+    claudeCalls: 0,
+    genuineSales3: bonus3?.genuine_sales,
+    bonusRs3:      bonus3?.bonus_rs,
+    expectedBonus: expectedBonus3,
+    pass: part1Pass && part2Pass && part3Pass,
+  };
+}
+
 // ── Run all tests and report ───────────────────────────────────────────────────
 
 async function run() {
   console.log('\n══════════════════════════════════════════════════════════════════');
-  console.log('  reward-calculator.js — 17-scenario bracket formula test suite');
+  console.log('  reward-calculator.js — 18-scenario bracket formula test suite');
   console.log('══════════════════════════════════════════════════════════════════\n');
 
   const tests = [
@@ -1173,6 +1250,7 @@ async function run() {
     { label: 'Display Wall:', fn: runTestO },
     { label: 'Budget:      ', fn: runTestP },
     { label: 'Messaging:   ', fn: runTestQ },
+    { label: 'Launch gate: ', fn: runTestR },
   ];
 
   const results = [];
@@ -1204,7 +1282,7 @@ async function run() {
 
   const totalCalls = claudeCallCount;
   const callsOk    = totalCalls === 1;  // Only Test Q calls Claude
-  console.log(`\n  ${callsOk ? '✓' : '✗'}  Total Claude calls across all 17 tests: ${totalCalls} (expected exactly 1)`);
+  console.log(`\n  ${callsOk ? '✓' : '✗'}  Total Claude calls across all 18 tests: ${totalCalls} (expected exactly 1)`);
   console.log(`  ${geminiAggCallCount > 0 ? '✓' : '✗'}  Gemini aggregation calls (mocked, period-aggregator.js): ${geminiAggCallCount}`);
 
   console.log('\n──────────────────────────────────────────────────────────────────');

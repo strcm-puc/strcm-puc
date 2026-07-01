@@ -6,7 +6,7 @@
 //  Case 1: Normal AB ID purchase → Layer 1 credit applied as usual.
 //  Case 2: ST Rupees store-code transaction → zero Layer 1, applyCredit not called.
 //  Case 3: Mixed period (normal + store-code) → only normal amount in genuineSales.
-//  Case 4: Full 17-test reward-calculator regression suite — 0 regressions.
+//  Case 4: Full 18-test reward-calculator regression suite — 0 regressions.
 // ════════════════════════════════════════════════════════════════════════════════
 
 const pathMod = require('path');
@@ -28,6 +28,11 @@ function freshBaseReward(applyCredit) {
       cat === 'rcm_login' ? { store_code: STORE_CODE } : { api_key: 'test' },
   });
   injectMock(pathMod.join(ROOT, 'pipeline', 'ledger-writer.js'), { applyCredit });
+  // launch_date gate defaults to "live since 2020" — this suite predates
+  // system-config.js's real Firestore doc, so stub it directly here.
+  injectMock(pathMod.join(ROOT, 'pipeline', 'system-config.js'), {
+    getLaunchDate: async () => new Date('2020-01-01T00:00:00'),
+  });
   delete require.cache[require.resolve('./base-reward-calculator')];
   return require('./base-reward-calculator');
 }
@@ -72,6 +77,9 @@ function makeFirestoreStore() {
   }
   const mockAdmin = { firestore: { FieldValue: { serverTimestamp: () => new Date().toISOString() } } };
   const mockDb    = { collection: makeCollRef };
+  // launch_date gate defaults to "live since 2020" so this suite (dated 2026)
+  // exercises the actual exclusion logic, not the not-yet-launched skip path.
+  store.set('system/config', { launch_date: '2020-01-01' });
   return { store, mockDb, mockAdmin };
 }
 
@@ -98,6 +106,7 @@ function freshRC(mockDb, mockAdmin) {
   delete require.cache[require.resolve('./ledger-writer')];
   delete require.cache[require.resolve('./customer-schema')];
   delete require.cache[require.resolve('./period-aggregator')];
+  delete require.cache[require.resolve('./system-config')];
   return require('./reward-calculator');
 }
 
@@ -265,11 +274,11 @@ async function case3() {
   return !!pass;
 }
 
-// ── Case 4: Full 17-test regression ───────────────────────────────────────────
+// ── Case 4: Full 18-test regression ───────────────────────────────────────────
 
 function case4() {
   console.log('\n──────────────────────────────────────────────────────────────');
-  console.log('  Case 4 — Full reward-calculator 17-test regression suite');
+  console.log('  Case 4 — Full reward-calculator 18-test regression suite');
   console.log('──────────────────────────────────────────────────────────────\n');
 
   try {
@@ -278,7 +287,7 @@ function case4() {
       stdio: 'pipe',
       encoding: 'utf8',
     });
-    console.log('  ✓  All 17 regression tests passed');
+    console.log('  ✓  All 18 regression tests passed');
     return true;
   } catch (e) {
     console.log('  ✗  Regression tests FAILED:');

@@ -146,6 +146,10 @@ const { ingestTransactions } = require('./data-ingestion');
 // array resolveMobile()'s array-contains query reads (see customer-schema.js).
 // ════════════════════════════════════════════════════════════════════════════════
 
+// launch_date gate defaults to "live since 2020" so this suite exercises the
+// actual base-reward/ingestion logic, not the not-yet-launched skip path.
+store.set('system/config', { launch_date: '2020-01-01' });
+
 // Case 1: AB ID — will be under tier threshold (1 000 < 5 000)
 store.set('customers/9999000001', {
   profile: {

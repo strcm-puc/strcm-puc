@@ -2,6 +2,7 @@
 
 const { applyCredit }   = require('./ledger-writer');
 const { getCredential } = require('../vault-read');
+const { getLaunchDate } = require('./system-config');
 
 let _rcmCreds;
 async function _getRcmStoreCode() {
@@ -14,6 +15,12 @@ async function _getRcmStoreCode() {
 // Layer 1 — guaranteed base reward, 1% of sale amount, no budget ceiling.
 // Skipped entirely when id_used matches the ST Rupees store code (redemption bills).
 async function calculateBaseReward(mobile, id_used, bill_number, sale_amount, date = new Date()) {
+  const launchDate = await getLaunchDate();
+  if (!launchDate || date < launchDate) {
+    console.log(`[base-reward] Bill ${bill_number}: dated before launch (or launch_date unset) — Layer 1 skipped`);
+    return { baseAmount: 0, ledgerResult: null };
+  }
+
   const storeCode = await _getRcmStoreCode();
   if (storeCode && String(id_used) === String(storeCode)) {
     console.log(`[base-reward] Bill ${bill_number}: id_used=${id_used} is ST Rupees store code — Layer 1 skipped`);

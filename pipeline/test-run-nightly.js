@@ -158,6 +158,10 @@ injectMock(pathMod.join(__dirname, 'scraper.js'), {
   markManuallyResolved: () => {},
 });
 
+// launch_date gate defaults to "live since 2020" so this integration test
+// demonstrates the actual reward flow, not the not-yet-launched skip path.
+store.set('system/config', { launch_date: '2020-01-01' });
+
 // ── Seed the store with the customer the stub transaction references ───────────
 store.set('customers/9999000001', {
   profile: {

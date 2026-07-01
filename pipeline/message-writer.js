@@ -58,6 +58,14 @@ async function _getRecentOpeners(mobile, n = 5) {
     .filter(Boolean);
 }
 
+// ── Template placeholder counting ─────────────────────────────────────────────
+// Counted deterministically in code rather than left for Gemini to count itself —
+// asking the model to both count {{n}} occurrences AND extract values in one pass
+// is where it previously under/over-reported the variable count.
+function _countPlaceholders(text) {
+  return new Set((text ?? '').match(/\{\{\d+\}\}/g) ?? []).size;
+}
+
 // ── Magic token ────────────────────────────────────────────────────────────────
 
 function _generateMagicToken() {
@@ -98,10 +106,16 @@ async function writeMessage(briefingObject) {
   const magicCode  = _generateMagicToken();
   const magicToken = `strcm.vercel.app/d/${magicCode}`;
 
-  // Template summary for Gemini
+  // Template summary for Gemini — full body text, untruncated (a truncated body
+  // hides trailing {{n}} placeholders), plus the EXACT required variable counts,
+  // computed deterministically here rather than left for Gemini to count itself.
   const templateSummary = templates.map(t => {
-    const body = t.components?.find(c => c.type === 'BODY')?.text ?? '';
-    return `  - name: "${t.name}" | lang: ${t.language} | body: "${body.slice(0, 120)}"`;
+    const body       = t.components?.find(c => c.type === 'BODY')?.text ?? '';
+    const header     = t.components?.find(c => c.type === 'HEADER')?.text ?? '';
+    const bodyCount   = _countPlaceholders(body);
+    const headerCount = _countPlaceholders(header);
+    return `  - name: "${t.name}" | lang: ${t.language} | body: "${body}" | ` +
+      `body_variables_required: ${bodyCount} | header_variables_required: ${headerCount}`;
   }).join('\n');
 
   const showRupee     = briefingObject.show_rupee_amount === true;
@@ -160,7 +174,11 @@ async function writeMessage(briefingObject) {
     '═══ INSTRUCTIONS ═══',
     '1. Select the single best-fitting approved template from the list above.',
     '2. Write the complete message body in Devanagari Hindi following all 25 laws.',
-    '3. Extract variable values ({{1}}, {{2}}, etc.) exactly as they appear in the template body.',
+    '3. body_variables and header_variables MUST contain EXACTLY body_variables_required and ' +
+      'header_variables_required values for the template you selected — no more, no fewer. ' +
+      'These counts are given to you already computed; do not count {{n}} yourself and do not ' +
+      'include any value that is not one of the template\'s own {{n}} placeholders (e.g. never put ' +
+      '"nothing" or any do-not-mention filler value into body_variables). If a count is 0, return an empty array.',
     '4. Return opener = first meaningful phrase after "जय RCM!" (4-6 words) — used for Law L8.',
     '',
     'Return ONLY a valid JSON object — no markdown, no text outside the braces:',
@@ -171,6 +189,32 @@ async function writeMessage(briefingObject) {
 
   if (!geminiResult.template_name) {
     throw new Error(`Gemini did not return a template_name. Raw: ${JSON.stringify(geminiResult).slice(0, 200)}`);
+  }
+
+  // Fail fast on a variable-count mismatch — Meta only reports this as an opaque
+  // "(#132000) Number of parameters does not match" after the live send is
+  // attempted; catching it here avoids a wasted Meta API call on a response
+  // Gemini didn't extract correctly.
+  const selectedTemplate = templates.find(t =>
+    t.name === geminiResult.template_name &&
+    t.language === (geminiResult.template_language ?? 'hi')
+  ) ?? templates.find(t => t.name === geminiResult.template_name);
+
+  if (selectedTemplate) {
+    const bodyText   = selectedTemplate.components?.find(c => c.type === 'BODY')?.text ?? '';
+    const headerText = selectedTemplate.components?.find(c => c.type === 'HEADER')?.text ?? '';
+    const expectedBody   = _countPlaceholders(bodyText);
+    const expectedHeader = _countPlaceholders(headerText);
+    const actualBody   = (geminiResult.body_variables ?? []).length;
+    const actualHeader = (geminiResult.header_variables ?? []).length;
+
+    if (actualBody !== expectedBody || actualHeader !== expectedHeader) {
+      throw new Error(
+        `Gemini template variable mismatch for "${geminiResult.template_name}": ` +
+        `body expects ${expectedBody}, got ${actualBody}; header expects ${expectedHeader}, got ${actualHeader}. ` +
+        `body_variables: ${JSON.stringify(geminiResult.body_variables)}`
+      );
+    }
   }
 
   // Persist magic token to customer profile

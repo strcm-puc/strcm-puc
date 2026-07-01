@@ -8,6 +8,7 @@ const {
   customerRef, idRef, periodRef, purchasesCol, ledgerEntriesCol,
   fiscalPeriodKey, isDisplayWallProfile,
 } = require('./customer-schema');
+const { getLaunchDate } = require('./system-config');
 
 // ── Test hook: inject a fixed "today" so unit tests control date-gating ───────
 let _nowFn = () => new Date();
@@ -197,6 +198,7 @@ function _getBudgetMax(profile, isDW) {
 // Groups purchases by calendar period across this customer's matching-type ids,
 // returns last N periods sorted ascending. Reads customers/{mobile}/ids/{id}/periods/*/purchases.
 async function fetchPurchaseHistory(mobile, linkedIds, isDW, periodsBack = 6) {
+  const launchDate = await getLaunchDate();
   const ids = _matchingIds(linkedIds, isDW);
   const grouped = {};
   for (const id of ids) {
@@ -207,6 +209,7 @@ async function fetchPurchaseHistory(mobile, linkedIds, isDW, periodsBack = 6) {
         const d  = p.data();
         const dt = parseDate(d.date);
         if (!dt) continue;
+        if (!launchDate || dt < launchDate) continue; // pre-launch activity never counts
         const key = getPeriodKey(dt, isDW);
         grouped[key] = (grouped[key] ?? 0) + (parseFloat(d.amount) || 0);
       }
@@ -221,6 +224,7 @@ async function fetchPurchaseHistory(mobile, linkedIds, isDW, periodsBack = 6) {
 // Sums purchases within a date range (inclusive) across matching-type ids.
 // excludeIds: optional Set of id values to skip entirely (ST Rupees store code).
 async function fetchPeriodSales(mobile, linkedIds, isDW, periodStart, periodEnd, excludeIds = null) {
+  const launchDate = await getLaunchDate();
   const storageKey = fiscalPeriodKey(periodStart, isDW);
   const ids = _matchingIds(linkedIds, isDW);
   const s = new Date(periodStart.getFullYear(), periodStart.getMonth(), periodStart.getDate());
@@ -233,6 +237,7 @@ async function fetchPeriodSales(mobile, linkedIds, isDW, periodStart, periodEnd,
       const d  = doc.data();
       const dt = parseDate(d.date);
       if (!dt) continue;
+      if (!launchDate || dt < launchDate) continue; // pre-launch activity never counts
       const day = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
       if (day >= s && day <= e) total += parseFloat(d.amount) || 0;
     }
@@ -242,6 +247,7 @@ async function fetchPeriodSales(mobile, linkedIds, isDW, periodStart, periodEnd,
 
 // Sums 'goods return reversal' ledger entries within a date range across matching-type ids.
 async function fetchPeriodReturns(mobile, linkedIds, isDW, periodStart, periodEnd) {
+  const launchDate = await getLaunchDate();
   const storageKey = fiscalPeriodKey(periodStart, isDW);
   const ids = _matchingIds(linkedIds, isDW);
   const s = new Date(periodStart.getFullYear(), periodStart.getMonth(), periodStart.getDate());
@@ -254,6 +260,7 @@ async function fetchPeriodReturns(mobile, linkedIds, isDW, periodStart, periodEn
       if (d.reason !== 'goods return reversal') continue;
       const ts = d.timestamp ? new Date(d.timestamp) : null;
       if (!ts || isNaN(ts.getTime())) continue;
+      if (!launchDate || ts < launchDate) continue; // pre-launch activity never counts
       const day = new Date(ts.getFullYear(), ts.getMonth(), ts.getDate());
       if (day >= s && day <= e) totalReturns += parseFloat(d.amount) || 0;
     }
@@ -272,6 +279,11 @@ function _primaryId(profile, customerId) {
 // using a rolling 3-period average (AB ID) or quarter-based stretch (DW — next step).
 async function setPeriodTarget(customerId, salesDate) {
   const today = salesDate ?? _nowFn();
+
+  const launchDate = await getLaunchDate();
+  if (!launchDate || today < launchDate) {
+    return { skipped: true, reason: 'launch_date not set or before launch' };
+  }
 
   const snap = await customerRef(customerId).get();
   if (!snap.exists) return { skipped: true, reason: 'customer not found' };
@@ -466,6 +478,11 @@ async function setPeriodTarget(customerId, salesDate) {
 async function decideDailyMessage(customerId, todaysPurchaseAmount, salesDate) {
   const today = salesDate ?? _nowFn();
 
+  const launchDate = await getLaunchDate();
+  if (!launchDate || today < launchDate) {
+    return { skipped: true, reason: 'launch_date not set or before launch' };
+  }
+
   const snap = await customerRef(customerId).get();
   if (!snap.exists) return { skipped: true, reason: 'customer not found' };
 
@@ -571,6 +588,11 @@ async function decideDailyMessage(customerId, todaysPurchaseAmount, salesDate) {
 // For Display Wall: bracket system implemented in DW step (stub writes zeros for now).
 async function checkPeriodEndBonus(customerId, salesDate) {
   const today = salesDate ?? _nowFn();
+
+  const launchDate = await getLaunchDate();
+  if (!launchDate || today < launchDate) {
+    return { skipped: true, reason: 'launch_date not set or before launch' };
+  }
 
   const snap = await customerRef(customerId).get();
   if (!snap.exists) return { skipped: true, reason: 'customer not found' };
@@ -864,6 +886,12 @@ async function checkPeriodEndBonus(customerId, salesDate) {
 // salesDate: the date of the night's scraped sales (yesterday from cron's perspective)
 async function runNightlyRewardChecks(processedMobiles, salesDate) {
   const today = salesDate ?? _nowFn();
+
+  const launchDate = await getLaunchDate();
+  if (!launchDate || today < launchDate) {
+    console.log('[reward] launch_date not set (or today is before launch) — system not live, skipping all reward checks');
+    return { skipped: true, reason: 'launch_date not set or before launch', briefings: [] };
+  }
 
   // Date-gated checks — run for ALL customers
   const customersSnap = await db.collection('customers').get();

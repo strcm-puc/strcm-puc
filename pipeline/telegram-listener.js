@@ -6,6 +6,7 @@ const { GoogleGenAI } = require('@google/genai');
 const { db, admin } = require('../firebase-config');
 const { getCredential } = require('../vault-read');
 const { idRef, tagLinkedIds, linkedIdValues } = require('./customer-schema');
+const { getLaunchDate, setLaunchDate } = require('./system-config');
 
 const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 
@@ -216,6 +217,41 @@ async function _handleCostCommand(chatId) {
   console.log('[listener] /cost answered — no spend tracking instrumented yet');
 }
 
+// ── /setlaunchdate YYYY-MM-DD — owner-only, sets /system/config.launch_date ───
+// Until this is set, reward-calculator.js refuses to count any reward-eligible
+// activity at all (see getLaunchDate() gates in setPeriodTarget, decideDailyMessage,
+// checkPeriodEndBonus, runNightlyRewardChecks, and the fetchPeriod*/fetchPurchaseHistory
+// date filters). There is no default — an unset launch_date means "not live".
+async function _handleSetLaunchDateCommand(chatId, text) {
+  const tg = await _getTgCreds();
+  if (!tg || chatId !== String(tg.admin_chat_id).trim()) return; // owner-only, silent for anyone else
+
+  const match = text.trim().match(/^\/setlaunchdate\s+(\d{4}-\d{2}-\d{2})$/i);
+  if (!match) {
+    const current = await getLaunchDate();
+    await _sendTelegramMessage(chatId,
+      `❓ Usage: <code>/setlaunchdate YYYY-MM-DD</code>\n` +
+      `Current launch_date: <code>${current ? current.toISOString().slice(0, 10) : 'not set'}</code>`
+    );
+    return;
+  }
+
+  const dateStr = match[1];
+  try {
+    await setLaunchDate(dateStr);
+  } catch (e) {
+    await _sendTelegramMessage(chatId, `❌ Invalid date: ${e.message}`);
+    return;
+  }
+
+  await _sendTelegramMessage(chatId,
+    `🚀 <b>Launch date set</b>\n` +
+    `launch_date = <code>${dateStr}</code>\n\n` +
+    `Reward-eligible activity dated before this will never be counted, even if ingested later.`
+  );
+  console.log(`[listener] /setlaunchdate ${dateStr} set by owner`);
+}
+
 // ── Process a single Telegram update ──────────────────────────────────────────
 
 async function _processUpdate(update) {
@@ -228,6 +264,12 @@ async function _processUpdate(update) {
   // ── /cost: owner-only spend report — standalone command, not a reply ──────
   if (replyText.toLowerCase() === '/cost') {
     await _handleCostCommand(chatId);
+    return;
+  }
+
+  // ── /setlaunchdate: owner-only launch-date config — standalone command ────
+  if (/^\/setlaunchdate\b/i.test(replyText)) {
+    await _handleSetLaunchDateCommand(chatId, replyText);
     return;
   }
 
@@ -363,4 +405,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { startListener, _extractPartyCodeFromAlert, _parseMobile, _parseCompoundReply, _createProfile, _processUpdate, _handleCostCommand };
+module.exports = { startListener, _extractPartyCodeFromAlert, _parseMobile, _parseCompoundReply, _createProfile, _processUpdate, _handleCostCommand, _handleSetLaunchDateCommand };
